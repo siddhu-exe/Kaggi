@@ -1,0 +1,48 @@
+node_modules/
+.env
+.env.*
+!.env.example
+env/
+__pycache__/
+*.pyc
+dist/
+build/
+
+# Project planning/docs not needed in git history
+BRAND_GUIDELINES.md
+PROJECT_PLAN.md
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache and tooling artifacts
+*.pyo
+*.pyd
+*.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backend runtime/generated files
+backend/uploads/
+
+
+# Logs and temp files
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local frontend overrides
+.env.local
+
+# Crack AI model artifact (large binary)
+
+
+# One-time data migration script (intentionally disabled)
+backend/scripts/sync_frontend_data.py
+
