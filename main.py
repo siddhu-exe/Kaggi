@@ -3,22 +3,30 @@ Kaggriculture competitive agent — main.py
 ==========================================
 
 A single-file, defensive agent for the Kaggle "Kaggriculture" two-player farming
-simulation.  Implements a phased economic strategy:
+simulation.  Strategy: **deploy capital on day 0, then scale from there.**
 
-    Phase 1  (Foundation, day 0..~4)   wheat + carrot staple engine, sell wheat
-                                        aggressively, pace carrot.
-    Phase 2  (Transition, day ~5..~9)  add tomato, buy a goose + coop, start
-                                        fertilizing high-value crops.
-    Phase 3  (Expansion,  day 10+)     buy land when full & flush, add
-                                        strawberry / melon / cow / sheep, pace
-                                        premium sells, watch the town + opponent.
+    In a 30-day season, idle cash produces nothing.  So on turn 1 we spend close
+    to the full $3000: max out hands (5 hands ~= $12 under Fibonacci pricing),
+    buy animals + their structures immediately (buying wheat feed from the market
+    rather than waiting to grow it), and buy seed across ALL crop types to fill
+    every tile.  Things then mature while we sit near-flat, and income spikes
+    mid-game as animals and ongoing crops hit production stride.  There are no
+    gated phases — everything starts day 0 and simply scales up.
+
+Selling is **price-reactive**, not a fixed schedule: every turn we read the live
+market price, compute price/base, and scale sell volume to it — dump near/above
+base, throttle hard toward the $1 floor.  This reacts to real conditions (which
+include our OWN selling moving the shared price curve) instead of guessing a cap.
+
+We also **diversify away from the opponent**: their farm is public, so we scan
+what they grow and lean toward glut-sensitive goods they are NOT flooding.
 
 Architecture (see Docs/GAME_MODEL.md for the full write-up):
     * GameState            module-global object, persists across turns.
     * TurnContext          per-turn parsed view of the observation + task lists.
     * decide_unit_action   one action per farmer / hand (priority checklist).
     * decide_market_orders BUY_SEED / BUY_ANIMAL / BUY_PRODUCT / SELL / BUY_LAND.
-    * decide_hiring        Fibonacci-priced HIRE orders at day start.
+    * decide_hiring        Fibonacci-priced HIRE orders at day start (5/day).
     * agent(obs)           top-level dispatcher, wrapped so it NEVER throws.
 
 Key spec facts baked in (verified against README.md / AGENTS.md):
@@ -30,10 +38,10 @@ Key spec facts baked in (verified against README.md / AGENTS.md):
       the same day or it weeds that night.  We only plant when there is time left
       in the day for a unit to water it.
     * FEED is assumed to consume wheat from the shed (documented assumption; we
-      always hold a wheat feed reserve so it works regardless of source).
+      buy market wheat as feed stock so animals can be bought early).
     * Glut-sensitive goods (carrot, strawberry, melon, milk, wool) crash toward
-      the $1 floor -> paced, capped sells.  Wheat / eggs absorb gluts -> sell
-      freely (keeping a wheat feed reserve).
+      the $1 floor -> steep sell throttle.  Wheat / eggs absorb gluts -> shallow
+      throttle, sell freely (keeping a wheat feed reserve).
 """
 
 import math
@@ -83,26 +91,46 @@ GLUT_TOLERANT = {"WHEAT", "EGG"}
 # Crops worth spending fertilizer on (high value / good return on the bonus).
 FERTILIZE_CROPS = {"MELON", "STRAWBERRY", "TOMATO", "CARROT"}
 
-# Per-turn SELL caps + a "don't sell below this fraction of base" pacing gate for
-# glut-sensitive goods.  Wheat / eggs are uncapped (cap 9999).
-SELL_RULES = {
-    "WHEAT":      {"cap": 9999, "min_frac": 0.0},   # sell surplus above feed reserve
-    "EGG":        {"cap": 9999, "min_frac": 0.0},
-    "TOMATO":     {"cap": 6,    "min_frac": 0.45},  # moderate
-    "CARROT":     {"cap": 3,    "min_frac": 0.45},
-    "STRAWBERRY": {"cap": 2,    "min_frac": 0.50},
-    "MELON":      {"cap": 2,    "min_frac": 0.50},
-    "MILK":       {"cap": 2,    "min_frac": 0.50},
-    "WOOL":       {"cap": 2,    "min_frac": 0.50},
-    "FERTILIZER": {"cap": 4,    "min_frac": 0.40},
+# Price-reactive selling.  Every turn we compute ratio = price / base and scale
+# sell volume between `throttle_floor` (sell nothing below it) and 1.0 (sell all
+# at/above base).  Glut-tolerant staples (wheat/eggs) have a LOW floor so we sell
+# them freely even when cheap; premium goods have a HIGH floor so we hold and wait
+# for price recovery instead of dumping into a crash.
+SELL_THROTTLE = {
+    "WHEAT":      {"floor": 0.25},   # absorbs gluts — sell surplus above feed reserve
+    "EGG":        {"floor": 0.25},
+    "TOMATO":     {"floor": 0.40},
+    "CARROT":     {"floor": 0.45},   # crashes on gluts
+    "STRAWBERRY": {"floor": 0.55},   # premium — crashes hard
+    "MELON":      {"floor": 0.55},
+    "MILK":       {"floor": 0.55},
+    "WOOL":       {"floor": 0.55},
+    "FERTILIZER": {"floor": 0.35},
 }
 
 SHED_CAPACITY = 100
 SHED_OVERFLOW_FORCE = 85    # when shed non-seed items exceed this, dump paced goods
 MAX_MARKET_ORDERS = 10
 
-# Cash we refuse to spend *seed money* below, per phase (big buys have own buffers).
-RESERVE_FLOOR = {1: 800, 2: 600, 3: 500}
+# Tiny working-cash buffer so we never fail mid-order — we otherwise spend it all.
+WORKING_CASH = 50
+
+# Hands to hire every day.  5 hands ~= $1+1+2+3+5 = $12/day under Fibonacci — the
+# labor is near-free, so there is no reason to hold back.
+HANDS_PER_DAY = 5
+
+# Single aggressive day-0 allocation for the opening (25-tile NW quadrant).  No
+# phases: this is the target from turn 1.  Ongoing crops (tomato/strawberry) and
+# animals are represented immediately so they start their long maturation early.
+BASE_ALLOCATION = [
+    ("WHEAT", 8),        # staple cash + animal-feed backstop
+    ("TOMATO", 4),       # ongoing daily production
+    ("MELON", 3),        # premium one-time
+    ("CARROT", 3),       # fast staple
+    ("STRAWBERRY", 2),   # premium ongoing
+    ("COOP", 1),         # goose
+    ("PASTURE", 1),      # cow / sheep
+]
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +142,13 @@ class GameState:
         self.reset()
 
     def reset(self):
-        self.phase = 1
         # Intended purpose per tile: {(x,y): {"kind":"CROP","crop":X}} or
         # {(x,y): {"kind":"STRUCT","structure":"COOP","animal":"GOOSE"}}
         self.tile_plan = {}
         self.last_day_hired = -1     # guard: hire only once per day
-        self.want_coop = False       # PHASE 2 gate for the first goose coop
-        self.want_pastures = False   # PHASE 3 gate for cow/sheep pastures
-        self.expansion_planned = False
+        # Day-0 front-load bookkeeping (see decide_market_orders).
+        self.animals_queued = set()  # animals we committed to buy on day 0
+        self.feed_bought = False     # bought the initial market-wheat feed stock
         self.notes = {}              # scratch for debugging / future tuning
 
 
@@ -350,20 +377,9 @@ def fert_eligible(tile, info, day):
 # ---------------------------------------------------------------------------
 
 def update_phase(ctx, state):
-    """Advance the phase.  Day thresholds are soft — real transitions are gated
-    on cash / infrastructure inside the buy logic, these just open the door."""
-    day = ctx.day
-    # --- PHASE 1 -> 2 : after ~day 5, once the staple engine is turning over. ---
-    if state.phase < 2 and day >= 5:
-        state.phase = 2
-    # --- PHASE 2 -> 3 : after day 10. ---
-    if state.phase < 3 and day >= 10:
-        state.phase = 3
-
-    # PHASE 2 gate: want a goose coop once we're in phase 2 (wheat feed sustainable).
-    state.want_coop = state.phase >= 2
-    # PHASE 3 gate: pastures for cow/sheep once expanded & cash is healthy.
-    state.want_pastures = state.phase >= 3 and ctx.money >= 1200
+    """No-op.  The phased strategy was replaced by day-0 capital deployment (see
+    module docstring).  Kept as a stub so the agent() dispatcher is untouched."""
+    return
 
 
 # ---------------------------------------------------------------------------
@@ -371,30 +387,30 @@ def update_phase(ctx, state):
 # ---------------------------------------------------------------------------
 
 def desired_allocation(ctx, state):
-    """Ordered [(item, target_count)] the current phase wants on the farm.
-    Filled greedily against available tiles, so earlier entries win the land."""
-    phase = state.phase
-    if phase == 1:
-        plan = [("WHEAT", 12), ("CARROT", 5)]                       # --- PHASE 1 ---
-    elif phase == 2:
-        plan = [("WHEAT", 10), ("TOMATO", 5), ("CARROT", 3)]        # --- PHASE 2 ---
-        if state.want_coop:
-            plan.append(("COOP", 1))
-    else:
-        plan = [("WHEAT", 12), ("TOMATO", 6), ("MELON", 4),         # --- PHASE 3 ---
-                ("STRAWBERRY", 4), ("CARROT", 3)]
-        if state.want_coop:
-            plan.append(("COOP", 1))
-        if state.want_pastures:
-            plan.append(("PASTURE", 2))
+    """Ordered [(item, target_count)] the farm wants — a single aggressive plan
+    used from day 0 (no phases).  Filled greedily against available tiles, so
+    earlier entries win the land.  Scales up as land is unlocked."""
+    plan = list(BASE_ALLOCATION)
 
-    # Opponent-overproduction guard: if the opponent is flooding a glut-sensitive
-    # crop, cut our target for it so we don't crash the price together.
-    opp_counts = _opp_crop_counts(ctx)
+    # More land unlocked -> scale staple + ongoing crops to fill it (each extra
+    # quadrant is 25 more tiles).  Premium/animals grow more slowly on purpose.
+    extra_quads = max(0, len(ctx.unlocked_quadrants) - 1)
+    if extra_quads:
+        plan += [("WHEAT", 6 * extra_quads), ("TOMATO", 4 * extra_quads),
+                 ("MELON", 3 * extra_quads), ("STRAWBERRY", 3 * extra_quads),
+                 ("CARROT", 2 * extra_quads), ("PASTURE", 1)]
+
+    # Opponent diversification: their farm is public.  Back off glut-sensitive
+    # crops they're flooding (shared price curve), lean into ones they've left open.
+    opp = _opp_crop_counts(ctx)
     adj = []
     for item, cnt in plan:
-        if item in GLUT_SENSITIVE and opp_counts.get(item, 0) >= 4:
-            cnt = max(1, cnt // 2)
+        if item in GLUT_SENSITIVE:
+            n = opp.get(item, 0)
+            if n >= 4:
+                cnt = max(1, cnt // 2)      # they're flooding it -> avoid the price war
+            elif n == 0:
+                cnt += 1                    # open lane -> lean in slightly
         adj.append((item, cnt))
     return adj
 
@@ -463,36 +479,24 @@ def assign_plans(ctx, state):
 # ---------------------------------------------------------------------------
 
 def decide_hiring(ctx, state):
+    """Hire HANDS_PER_DAY hands every day at hour 0.  Fibonacci pricing makes this
+    near-free (5 hands ~= $12), so labor is deployed to the max from day 0."""
     if ctx.hour != 0:
         return []
     if state.last_day_hired == ctx.day:
         return []
     state.last_day_hired = ctx.day
 
-    # --- Hand count by phase (Fibonacci keeps these cheap: 3 hands = $4/day). ---
-    n_quads = len(ctx.unlocked_quadrants)
-    if state.phase == 1:
-        target = 3                                   # --- PHASE 1 ---
-    elif state.phase == 2:
-        target = 3                                   # --- PHASE 2 ---
-    else:
-        target = min(6, 2 + n_quads)                 # --- PHASE 3: scale w/ land ---
-
-    # Never let hiring alone eat the reserve (fib cost is tiny, but be safe).
-    reserve = RESERVE_FLOOR.get(state.phase, 500)
     cost = 0
     a, b = 1, 1
     orders = []
-    for i in range(target):
+    for _ in range(HANDS_PER_DAY):
         fib = a
         if ctx.money - (cost + fib) < 0:
-            break
+            break  # can't afford the next hire this early — stop
         cost += fib
         orders.append(["HIRE"])
         a, b = b, a + b
-    # Keep at least a little cash even after hiring (cheap so rarely binds).
-    if ctx.money - cost < reserve and len(orders) > 1 and state.phase >= 2:
-        pass  # hiring is cheap enough that we allow it; reserve guards big buys
     return orders
 
 
@@ -501,141 +505,182 @@ def decide_hiring(ctx, state):
 # ---------------------------------------------------------------------------
 
 def decide_market_orders(ctx, state):
+    """Front-loaded buys + price-reactive sells, capped at MAX_MARKET_ORDERS.
+    The whole point: deploy nearly the full $3000 on day 0."""
     orders = []
     orders.extend(decide_hiring(ctx, state))
 
-    reserve = RESERVE_FLOOR.get(state.phase, 500)
     money = ctx.money
+    counts = _struct_animal_counts(ctx)          # how many structures / animals exist
+    feed_reserve = _wheat_feed_reserve(ctx, counts)
 
-    # ---- 1) BUY_LAND (PHASE 3 only, deliberate: full land + healthy cash) ----
-    if state.phase >= 3:                                      # --- PHASE 3 ---
-        extras = max(0, len(ctx.unlocked_quadrants) - 1)
-        land_costs = [1000, 2000, 4000]
-        if extras < len(land_costs):
-            land_cost = land_costs[extras]
-            nearly_full = len(ctx.empty_tiles) <= 3
-            if nearly_full and money >= land_cost + 1200:
-                orders.append(["BUY_LAND"])
-                money -= land_cost
-
-    # ---- 2) BUY_ANIMAL (buy the animal once its empty structure exists) ----
-    #        Structure is *built* by a unit; we buy the animal so a unit can PLACE it.
-    for (x, y, kind, tile) in ctx.empty_structs:
-        want_animal = "GOOSE" if kind == "COOP" else None
-        if want_animal is None:
-            # Pasture: prefer cow first, then sheep (PHASE 3), if we can afford it.
-            want_animal = "COW" if state.phase >= 3 else None
-        if want_animal is None:
-            continue
-        info = ANIMALS.get(want_animal, {})
-        cost = info.get("cost", 99999)
-        buffer = 400 if want_animal == "GOOSE" else 600
-        already = _get(ctx.shed, want_animal, 0)
-        if already <= 0 and money >= cost + buffer:
-            orders.append(["BUY_ANIMAL", want_animal, 1])
+    # ---- 1) BUY_ANIMAL (front-loaded: buy as soon as a coop/pasture is planned) ----
+    #        Animals take days to reach first production, so every day of delay is a
+    #        lost cycle.  We buy the animal now; a unit builds the structure and
+    #        PLACEs it.  We buy the market wheat feed (step 3) so it never starves.
+    for want, struct in (("GOOSE", "COOP"), ("COW", "PASTURE")):
+        desired = counts["planned"].get(struct, 0) + counts["built"].get(struct, 0)
+        have = counts["animals"].get(want, 0)   # in shed + placed
+        need = desired - have
+        cost = ANIMALS[want]["cost"]
+        # Buy at most one of each per turn (keeps cash flow smooth); WORKING_CASH
+        # buffer only — we intentionally spend almost everything.
+        if need > 0 and money - cost >= WORKING_CASH:
+            orders.append(["BUY_ANIMAL", want, 1])
             money -= cost
-            break  # one animal purchase per turn keeps cash flow smooth
 
-    # ---- 3) BUY_SEED (cover planned-but-unseeded tiles, respect reserve) ----
+    # ---- 2) BUY_SEED across ALL crop types to fill every planned tile ----
     seed_need = {}
     for coord, p in state.tile_plan.items():
-        if p["kind"] != "CROP":
-            continue
-        crop = p["crop"]
-        seed_need[crop] = seed_need.get(crop, 0) + 1
-    # Order: cheap staples first so they always plant; premium only in later phases.
+        if p.get("kind") == "CROP":
+            seed_need[p["crop"]] = seed_need.get(p["crop"], 0) + 1
+    # Cheap staples first so they always land; then premium (still bought day 0).
     for crop in ("WHEAT", "CARROT", "TOMATO", "MELON", "STRAWBERRY"):
-        want = seed_need.get(crop, 0)
-        have = int(_get(ctx.seeds_remaining, crop, 0))
-        buy = want - have
+        buy = seed_need.get(crop, 0) - int(_get(ctx.seeds_remaining, crop, 0))
         if buy <= 0:
             continue
         unit = CROPS[crop]["seed"]
-        # Buy as many as we can afford above the reserve floor.
-        affordable = int(max(0, (money - reserve)) // unit)
+        affordable = int(max(0, (money - WORKING_CASH)) // unit)
         n = min(buy, affordable)
         if n > 0:
             orders.append(["BUY_SEED", crop, n])
             money -= n * unit
 
-    # ---- 4) BUY_PRODUCT WHEAT (top up feed reserve if short & we own animals) ----
-    feed_reserve = _wheat_feed_reserve(ctx)
+    # ---- 3) BUY_PRODUCT WHEAT as feed stock (don't wait to grow our own) ----
+    #        Enables buying animals early: we top the shed to the feed reserve.
     wheat_have = int(_get(ctx.shed, "WHEAT", 0))
-    if ctx.placed_animals > 0 and wheat_have < feed_reserve:
+    total_animals_planned = sum(counts["planned"].get(s, 0) + counts["built"].get(s, 0)
+                                for s in ("COOP", "PASTURE"))
+    if total_animals_planned > 0 and wheat_have < feed_reserve:
         wprice = int(_get(ctx.prices, "WHEAT", BASE_PRICES["WHEAT"]))
-        if wprice <= BASE_PRICES["WHEAT"] * 1.6 and money > reserve:
+        if wprice <= BASE_PRICES["WHEAT"] * 1.8 and money > WORKING_CASH:
             n = min(feed_reserve - wheat_have,
-                    int(max(0, (money - reserve)) // max(1, wprice)))
+                    int(max(0, (money - WORKING_CASH)) // max(1, wprice)))
             if n > 0:
                 orders.append(["BUY_PRODUCT", "WHEAT", n])
                 money -= n * wprice
+                state.feed_bought = True
 
-    # ---- 5) BUY_PRODUCT FERTILIZER (PHASE 2+, small top-up for high-value crops) ----
-    if state.phase >= 2 and ctx.fertilize_tiles:                # --- PHASE 2 ---
-        fert_have = int(_get(ctx.shed, "FERTILIZER", 0))
-        if fert_have < 3 and money >= 900:
-            fprice = int(_get(ctx.prices, "FERTILIZER", BASE_PRICES["FERTILIZER"]))
-            n = min(3 - fert_have, 2)
-            if fprice <= BASE_PRICES["FERTILIZER"] * 1.4 and money - n * fprice > reserve + 500:
-                orders.append(["BUY_PRODUCT", "FERTILIZER", n])
-                money -= n * fprice
+    # ---- 4) BUY_PRODUCT FERTILIZER (small stock for high-value crops) ----
+    fert_have = int(_get(ctx.shed, "FERTILIZER", 0))
+    if fert_have < 3 and money >= 600:
+        fprice = int(_get(ctx.prices, "FERTILIZER", BASE_PRICES["FERTILIZER"]))
+        n = min(3 - fert_have, 2)
+        if fprice <= BASE_PRICES["FERTILIZER"] * 1.5 and money - n * fprice > WORKING_CASH:
+            orders.append(["BUY_PRODUCT", "FERTILIZER", n])
+            money -= n * fprice
 
-    # ---- 6) SELL (paced for glut-sensitive goods; wheat/eggs freely) ----
+    # ---- 5) BUY_LAND (ungated: buy when NW is nearly full AND cash is healthy) ----
+    extras = max(0, len(ctx.unlocked_quadrants) - 1)
+    land_costs = [1000, 2000, 4000]
+    if extras < len(land_costs):
+        land_cost = land_costs[extras]
+        nearly_full = len(ctx.empty_tiles) <= 3
+        # Keep a working buffer beyond the land cost so we can seed the new land.
+        if nearly_full and money >= land_cost + 800:
+            orders.append(["BUY_LAND"])
+            money -= land_cost
+
+    # ---- 6) SELL (price-reactive volume; wheat feed reserve carved out) ----
     orders.extend(decide_sells(ctx, state, feed_reserve))
 
     # Respect the per-turn order cap (extras are silently dropped by the engine).
     return orders[:MAX_MARKET_ORDERS]
 
 
-def _wheat_feed_reserve(ctx):
-    """Wheat to hold in the shed as animal feed: a few days' buffer per animal."""
-    if ctx.placed_animals <= 0:
+def _struct_animal_counts(ctx):
+    """Count planned vs built structures and owned (shed + placed) animals so we
+    can front-load animal purchases without re-buying after placement."""
+    planned = {"COOP": 0, "PASTURE": 0}
+    for p in STATE.tile_plan.values():
+        if p.get("kind") == "STRUCT":
+            planned[p["structure"]] = planned.get(p["structure"], 0) + 1
+
+    built = {"COOP": 0, "PASTURE": 0}
+    animals = {"GOOSE": 0, "COW": 0, "SHEEP": 0}
+    for (x, y) in ctx.unlocked:
+        t = get_tile(ctx.tiles, x, y)
+        if isinstance(t, dict) and t.get("kind") in ("COOP", "PASTURE"):
+            built[t["kind"]] += 1
+            a = t.get("animal")
+            if a in animals:
+                animals[a] += 1                 # placed animals
+    for a in animals:                            # animals sitting in the shed
+        animals[a] += int(_get(ctx.shed, a, 0))
+    return {"planned": planned, "built": built, "animals": animals}
+
+
+def _wheat_feed_reserve(ctx, counts=None):
+    """Wheat to hold in the shed as animal feed.  Front-loaded: sized to the
+    animals we intend to own (planned + built structures), not just placed ones,
+    so we stock feed before the animals even arrive."""
+    if counts is None:
+        counts = _struct_animal_counts(ctx)
+    intended = sum(counts["planned"].get(s, 0) + counts["built"].get(s, 0)
+                   for s in ("COOP", "PASTURE"))
+    if intended <= 0:
         return 0
-    return ctx.placed_animals * 3 + 2
+    return intended * 4 + 3   # ~4 days' feed buffer per animal + slack
 
 
 def decide_sells(ctx, state, feed_reserve):
-    """Build SELL orders honoring caps, price floors, and the wheat feed reserve."""
+    """Price-reactive SELL orders.  Volume scales with the live price relative to
+    base: dump near/above base, throttle hard toward the $1 floor.  Because BOTH
+    players sell into the same shared price curve, reacting to the real price is
+    the correct response to 'the market moved' — no fixed cap schedule."""
     sells = []
     shed = ctx.shed
     prices = ctx.prices
     overflow = ctx.shed_total > SHED_OVERFLOW_FORCE
 
-    # Bias order: town-demanded goods first, then glut-tolerant, then the rest.
+    # Bias order: town-demanded goods first, then glut-tolerant, then higher price.
     demanded = _town_demanded_goods(ctx)
-    sellable = [g for g in SELL_RULES.keys() if int(_get(shed, g, 0)) > 0]
+    sellable = [g for g in SELL_THROTTLE if int(_get(shed, g, 0)) > 0]
 
     def sort_key(g):
-        return (0 if g in demanded else 1,          # demanded first
-                0 if g in GLUT_TOLERANT else 1,     # then gluttolerant
-                -int(_get(prices, g, 0)))           # then higher price
+        return (0 if g in demanded else 1,
+                0 if g in GLUT_TOLERANT else 1,
+                -int(_get(prices, g, 0)))
     sellable.sort(key=sort_key)
 
     for good in sellable:
         have = int(_get(shed, good, 0))
-        rule = SELL_RULES[good]
-        price = int(_get(prices, good, BASE_PRICES.get(good, 1)))
-        base = BASE_PRICES.get(good, price)
-
-        # Reserve wheat as feed before selling any.
+        # Carve out the wheat feed reserve before selling any wheat.
         if good == "WHEAT":
             have = max(0, have - feed_reserve)
-            if have <= 0:
-                continue
-
-        # Pacing gate for glut-sensitive goods: wait for price recovery unless the
-        # shed is about to overflow (then dump to avoid end-of-day discard).
-        if good in GLUT_SENSITIVE or rule["min_frac"] > 0:
-            if price < base * rule["min_frac"] and not overflow:
-                continue
-
-        n = min(have, rule["cap"])
-        if overflow:
-            n = have  # dump everything when overflow-threatened
+        if have <= 0:
+            continue
+        n = _sell_quantity(good, have, int(_get(prices, good, BASE_PRICES.get(good, 1))),
+                           overflow)
         if n > 0:
             sells.append(["SELL", good, n])
 
     return sells
+
+
+def _sell_quantity(good, have, price, overflow):
+    """Price-reactive sell volume for `have` units of `good` at the live `price`.
+    Scales linearly between the per-good throttle floor and base price; dumps at/
+    above base or on overflow; holds near the floor.  Premium (glut-sensitive)
+    goods are clamped to <= half the holding per turn so one order can't tank the
+    shared price curve."""
+    base = BASE_PRICES.get(good, 1) or 1
+    ratio = price / base
+    floor = SELL_THROTTLE.get(good, {"floor": 0.4})["floor"]
+
+    if overflow:
+        n = have                                     # forced dump: shed near cap
+    elif ratio < floor:
+        n = 0                                         # too cheap -> hold, wait
+    elif ratio >= 1.0:
+        n = have                                      # at/above base -> sell all
+    else:
+        frac = (ratio - floor) / (1.0 - floor)        # 0..1 linear ramp
+        n = max(1, int(have * frac))
+
+    if good in GLUT_SENSITIVE and not overflow:
+        n = min(n, max(2, have // 2))
+    return n
 
 
 def _town_demanded_goods(ctx):
@@ -795,7 +840,7 @@ def _shed_pickup_action(ctx, state, idx, inv):
                     return ["PICKUP", aname, 1]
 
     # Fertilizer pickup: candidates exist, shed has fertilizer, we carry none.
-    if state.phase >= 2 and ctx.fertilize_tiles:
+    if ctx.fertilize_tiles:
         if int(_get(ctx.shed_ledger, "FERTILIZER", 0)) > 0 and int(_get(inv, "FERTILIZER", 0)) == 0:
             ctx.shed_ledger["FERTILIZER"] = int(ctx.shed_ledger.get("FERTILIZER", 0)) - 1
             return ["PICKUP", "FERTILIZER", 1]

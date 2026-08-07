@@ -122,53 +122,66 @@ grow, decay, weeds), market price refresh, income update, farm update.
 ## Part 2 — Our Agent (`main.py`)
 
 ### Strategy in one paragraph
-A **phased** economy. **Phase 1 (Foundation, day 0–~4):** wheat + carrot staple
-engine; hire 3 hands; sell wheat freely, pace carrot; hold a wheat reserve as
-future animal feed. **Phase 2 (Transition, day ~5–9):** add tomato; build a coop +
-buy a goose once wheat feed is sustainable; feed + `CARE` daily; start fertilizing
-high-value crops inside their bonus window. **Phase 3 (Expansion, day 10+):** buy
-land only when the farm is nearly full **and** cash is healthy; add
-strawberry/melon/cow/sheep; give premium crops/animals first priority for
-water/feed/care/fertilizer; pace premium sells; bias selling toward town-demanded
-goods; cut production of a glut good the opponent is already flooding.
+**Deploy capital on day 0, then scale from there — no phases.** In a 30-day season
+idle cash produces nothing, so on turn 1 we spend close to the full $3000: hire the
+max **5 hands** (≈ $12 under Fibonacci — near-free labor), **buy animals + their
+structures immediately** (buying market wheat as feed rather than waiting to grow
+it, since animals take days to reach first production), and **buy seed across ALL
+crop types** to fill every tile — staples *and* premium/ongoing crops from the
+start. Everything then matures while we sit near-flat, and income spikes mid-game
+as animals and ongoing crops hit production stride. **Selling is price-reactive:**
+every turn we read the live market price, compute `price / base`, and scale sell
+volume to it — dump near/above base, throttle hard toward the $1 floor (steeper for
+premium goods, shallow for wheat/eggs). Because both players sell into the *same
+shared price curve*, reacting to the real price is the correct response — there is
+no fixed cap schedule and no opponent "targeting" us. We also **diversify away from
+the opponent**: their farm is public, so we back off glut-sensitive crops they're
+flooding and lean into lanes they've left open. Land expands only when the current
+quadrant is nearly full **and** cash is healthy.
 
 ### Code map
 | Piece | Responsibility |
 |-------|----------------|
-| `GameState` / `STATE` | Module-global, persists across turns within an episode. Holds `phase`, `tile_plan` (intended crop/structure per tile), `last_day_hired`, `want_coop`, `want_pastures`. `reset()` at episode start via `_reset_if_new_episode`. |
+| `GameState` / `STATE` | Module-global, persists across turns within an episode. Holds `tile_plan` (intended crop/structure per tile), `last_day_hired`, plus day-0 bookkeeping (`animals_queued`, `feed_bought`). `reset()` at episode start via `_reset_if_new_episode`. |
 | `TurnContext` | Parses `obs` once per turn: money, tiles, hands, shed, seeds, prices, town. Scans the world into task lists: `harvest_tiles`, `water_tiles`, `fertilize_tiles`, `weed_tiles`, `empty_tiles`, `animal_tiles`, `empty_structs`. Tracks `claimed` (tiles handled this turn) and `shed_ledger`/`seeds_remaining` (mutable, so units don't double-spend). |
-| `update_phase` | Soft day-based phase advance (≥5 → 2, ≥10 → 3); real gating is by cash/infrastructure in the buy logic. |
-| `assign_plans` / `desired_allocation` | Decide what each empty tile should become; keep stable per-tile plans; adjust down if the opponent is flooding a glut good. |
-| `decide_unit_action(ctx, state, idx)` | **Priority checklist** for one unit (farmer = idx 0, hands = idx≥1). First match wins: HARVEST → WATER → FERTILIZE → FEED → CARE → COLLECT_FERTILIZER → PLACE animal → BUILD → PLANT → DIG weed; else move to nearest highest-priority task; else carry produce to shed / `DROP`; else `PASS`. High-value tiles outrank staples via `_tile_value`. |
-| `decide_market_orders(ctx, state)` | Assembles, in priority order then truncates to 10: HIRE → BUY_LAND → BUY_ANIMAL → BUY_SEED → BUY_PRODUCT wheat (feed) → BUY_PRODUCT fertilizer → paced SELLs. |
-| `decide_hiring(ctx, state)` | Once/day at hour 0; 3 hands in phases 1–2, scales with land in phase 3; Fibonacci-cost-aware. |
-| `decide_sells(ctx, state, feed_reserve)` | Per-good SELL orders honoring per-turn caps, a "don't sell below `min_frac × base`" price gate for glut goods, the wheat feed reserve, and a forced dump when the shed nears overflow. Biases town-demanded goods first. |
+| `update_phase` | **No-op stub** (kept so the `agent()` dispatcher is untouched). The phased strategy was replaced by day-0 deployment. |
+| `assign_plans` / `desired_allocation` | Decide what each empty tile should become. `desired_allocation` returns a **single** aggressive plan (`BASE_ALLOCATION`) used from day 0, scaled up per unlocked quadrant, then adjusted for **opponent diversification** (back off glut goods they flood, lean into ones they have zero of). |
+| `decide_unit_action(ctx, state, idx)` | **Priority checklist** for one unit (farmer = idx 0, hands = idx≥1). First match wins: HARVEST → WATER → FERTILIZE → FEED → CARE → COLLECT_FERTILIZER → PLACE animal → BUILD → PLANT → DIG weed; else move to nearest highest-priority task; else carry produce to shed / `DROP`; else `PASS`. High-value tiles outrank staples via `_tile_value`. *(Unchanged in this pivot.)* |
+| `decide_market_orders(ctx, state)` | Assembles, then truncates to 10: HIRE → **BUY_ANIMAL** (front-loaded) → **BUY_SEED all crops** → **BUY_PRODUCT wheat feed** → BUY_PRODUCT fertilizer → BUY_LAND → price-reactive SELLs. Spends down toward `WORKING_CASH` — no big reserve. |
+| `decide_hiring(ctx, state)` | Once/day at hour 0; **`HANDS_PER_DAY` (5) every day**, Fibonacci-cost-aware. |
+| `_struct_animal_counts(ctx)` | Counts planned vs built coops/pastures and owned animals (shed + placed), so we front-load animal buys without re-buying after placement. |
+| `decide_sells(ctx, state, feed_reserve)` → `_sell_quantity` | **Price-reactive** SELL orders: volume scales linearly between a per-good `SELL_THROTTLE` floor and base price; dump at/above base or on overflow; hold near the floor. Carves out the wheat feed reserve; biases town-demanded goods first; clamps premium goods to ≤ half the holding per turn. |
 | `agent(obs)` | Top-level dispatcher. **Wrapped in try/except** — any bug returns a safe `{"farmer":["PASS"], "hands":[["PASS"]…], "market":[]}` so a runtime error can never fail the validation episode. |
 
 ### Key invariants the code maintains
 - **Never plant what can't be watered today.** `PLANT` only fires when the seed is
   held **and** `hour < turnsPerDay - 2` (time left for a unit to water it), so a
   fresh seed never weeds on planting night.
-- **Always hold a wheat feed reserve** = `animals × 3 + 2`. Wheat sells only the
-  surplus above this; feed top-ups buy wheat when short.
-- **Pace glut goods.** `SELL_RULES` caps per-turn volume (strawberry/melon/milk/
-  wool ≤ 2, carrot ≤ 3, tomato ≤ 6; wheat/eggs uncapped) and skips selling below a
-  price floor — unless the shed is about to overflow (then dump to avoid discard).
+- **Feed before you own.** The wheat feed reserve is sized to animals we *intend* to
+  own (planned + built structures), not just placed ones, and we buy market wheat to
+  reach it — so animals are safe to buy on day 0. Wheat sells only the surplus above
+  this reserve.
+- **Price-reactive selling.** `_sell_quantity` scales volume to `price/base` between
+  a per-good `SELL_THROTTLE` floor and 1.0; dumps at/above base or on shed overflow;
+  holds near the floor. Premium goods are additionally clamped to ≤ half the holding
+  per turn so one order can't tank the shared curve.
 - **Loose multi-unit de-confliction.** Each unit claims the nearest unclaimed task
   (`ctx.claimed`), so hands spread out instead of stacking on one tile.
 
 ### Tuning knobs (where to adjust behavior)
-- **Phase day thresholds:** `update_phase` (`day >= 5`, `day >= 10`). Every
-  phase-gated branch is marked with a `# --- PHASE N ---` comment.
-- **Cash reserves:** `RESERVE_FLOOR = {1:800, 2:600, 3:500}` (seed-money floor);
-  big-buy buffers inline in `decide_market_orders` (animal buffer, land `+1200`).
-- **Tile allocation targets:** `desired_allocation` (counts per crop/structure per
-  phase).
-- **Sell pacing:** `SELL_RULES` (`cap`, `min_frac`), `SHED_OVERFLOW_FORCE`.
-- **Feed safety:** `_wheat_feed_reserve`.
-- **Hiring counts:** `decide_hiring` (`target` per phase).
+- **Day-0 allocation:** `BASE_ALLOCATION` (counts per crop/structure) and the
+  per-quadrant scale-up in `desired_allocation`.
+- **Working cash / spend aggression:** `WORKING_CASH` (single small buffer; raise it
+  to spend less aggressively).
+- **Hiring:** `HANDS_PER_DAY`.
+- **Sell throttle:** `SELL_THROTTLE` (`floor` per good — lower = sell cheaper),
+  `SHED_OVERFLOW_FORCE`, and the premium half-clamp in `_sell_quantity`.
+- **Feed safety:** `_wheat_feed_reserve` (multiplier per animal).
+- **Land expansion:** `nearly_full` threshold + cash buffer in
+  `decide_market_orders` step 5.
 - **Which crops get fertilizer:** `FERTILIZE_CROPS`.
 - **Glut classification:** `GLUT_SENSITIVE`, `GLUT_TOLERANT`.
+- **Opponent diversification:** the flood/open-lane rule in `desired_allocation`.
 
 ### Testing
 `main.py` has an `if __name__ == "__main__":` harness that runs the agent vs
@@ -183,15 +196,16 @@ It also imports cleanly (the harness is guarded), so Kaggle's
 `from main import agent` works for submission:
 
 ```bash
-kaggle competitions submit kaggriculture -f main.py -m "phased agent v1"
+kaggle competitions submit kaggriculture -f main.py -m "front-loaded agent v2"
 ```
 
 ### Known limitations / future work (for the RL folder or a later pass)
+- The 10-orders/turn cap means a full day-0 buy list (5 hires + 2 animals + several
+  seed/feed buys) spills across the first few turns rather than all landing on turn
+  0 — fine in practice, but worth noting when reading replays.
 - Selling lags harvest by design (shed pipeline); a smarter courier policy could
   route a dedicated hand to `DROP` mid-day for faster liquidity.
-- Animal expansion (cow/sheep) is conservative; thresholds in `decide_market_orders`
-  and `desired_allocation` can be pushed once cash flow is validated in replays.
-- No explicit opponent-price modeling beyond the flood-avoidance heuristic in
+- Opponent modeling is a simple flood-avoidance / open-lane heuristic in
   `desired_allocation`; a reinforcement-learning agent (the `reinforement agent/`
   folder, intentionally left empty here) could learn sell timing and expansion
   cadence from replays.
