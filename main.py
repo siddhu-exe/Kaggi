@@ -45,6 +45,7 @@ Key spec facts baked in (verified against README.md / AGENTS.md):
 """
 
 import math
+import json
 
 # ---------------------------------------------------------------------------
 # CONSTANTS  (tune these — every phase threshold is marked with a PHASE comment)
@@ -982,6 +983,8 @@ if __name__ == "__main__":
     for opp in ["random", "starter"]:
         env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
         env.run([agent, opp])
+        with open("replay.json", "w", encoding="utf-8") as f:
+            json.dump(env.toJSON(), f)
         final = env.steps[-1]
         results = []
         for i, s in enumerate(final):
