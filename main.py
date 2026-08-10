@@ -1146,49 +1146,42 @@ if __name__ == "__main__":
         print("kaggle_environments not installed:", e)
         raise SystemExit(1)
 
-    print("=" * 72)
-    print("KAGGRICULTURE V7 — PRODUCTION THROUGHPUT / FULL LAND")
-    print("=" * 72)
-    print("Benchmark: OUR AGENT vs Kaggle starter")
-    print("Key V7 changes: 8 hands, 30 market orders, 100-tile scheduler,")
-    print("expansion workers, earlier land, larger production portfolio, day-26 liquidation.")
-
     STATES[0].reset()
     STATES[1].reset()
 
     env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
-    env.run([agent, "starter"])
+    env.run([agent, agent])
 
-    print("\nDaily checkpoints:")
+    print("\nDaily checkpoints (Agent vs Agent):")
     for step_no, step in enumerate(env.steps):
         if not isinstance(step, list) or step_no % 24 != 1:
             continue
-        p = step[0] if isinstance(step[0], dict) else {}
-        obs = p.get("observation", {}) if isinstance(p, dict) else {}
+        source = step[0] if step and isinstance(step[0], dict) else {}
+        obs = source.get("observation", {}) if isinstance(source, dict) else {}
         farms = obs.get("farms", []) or []
-        farm = farms[0] if farms else {}
-        tiles = farm.get("tiles", []) or []
-        unlocked = 0
-        occupied = 0
-        for row in tiles:
-            for tile in row:
-                if tile != "LOCKED":
-                    unlocked += 1
-                    if tile is not None:
-                        occupied += 1
-        print(
-            f"DAY {step_no // 24:02d} | "
-            f"money={farm.get('money')} | "
-            f"hands={len(farm.get('hands', []) or [])} | "
-            f"land={farm.get('unlocked_quadrants')} | "
-            f"occupied={occupied}/{unlocked}"
-        )
+        for player_idx, farm in enumerate(farms[:2]):
+            tiles = farm.get("tiles", []) or []
+            unlocked = 0
+            occupied = 0
+            for row in tiles:
+                for tile in row:
+                    if tile != "LOCKED":
+                        unlocked += 1
+                        if tile is not None:
+                            occupied += 1
+            print(
+                f"DAY {step_no // 24:02d} | PLAYER {player_idx + 1} | "
+                f"money={farm.get('money')} | "
+                f"hands={len(farm.get('hands', []) or [])} | "
+                f"land={farm.get('unlocked_quadrants')} | "
+                f"occupied={occupied}/{unlocked}"
+            )
 
     final = env.steps[-1]
     print("\nFINAL RESULT")
     for i, s in enumerate(final):
         if isinstance(s, dict):
-            print(f"PLAYER {i}: reward={s.get('reward')} status={s.get('status')}")
+            print(f"PLAYER {i + 1} (AGENT): reward={s.get('reward')} status={s.get('status')}")
 
     with open("replay.json", "w", encoding="utf-8") as f:
         json.dump(env.toJSON(), f)

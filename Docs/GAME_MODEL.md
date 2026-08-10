@@ -184,13 +184,20 @@ quadrant is nearly full **and** cash is healthy.
 - **Opponent diversification:** the flood/open-lane rule in `desired_allocation`.
 
 ### Testing
-`main.py` has an `if __name__ == "__main__":` harness that runs the agent vs
-`random` and `starter` over a full 720-turn season and prints final rewards:
+`main.py` has an `if __name__ == "__main__":` harness that runs **Agent vs Agent**
+over a full 720-turn season. Its daily checkpoints print separate labeled rows for
+**Player 1** and **Player 2**, including money, hands, unlocked land, and occupied
+tiles. The final output reports both agents' rewards and statuses:
 
 ```bash
 pip install -U kaggle-environments
 python main.py
 ```
+
+The evolutionary tuner also exposes both sides of every match. Each entry in its
+`games` output contains the matchup, a `player_1` result, a `player_2` result, and
+the candidate's score margin. Its last evaluation episode is Agent vs Agent;
+earlier episodes rotate through the built-in starter and random opponents.
 
 It also imports cleanly (the harness is guarded), so Kaggle's
 `from main import agent` works for submission:

@@ -111,9 +111,18 @@ def evaluate(agent_module, episodes):
         env = make("kaggriculture", configuration={"episodeSteps": 720, "seed": 1000 + i}, debug=False)
         env.run([agent_module.agent, opp])
         final = env.steps[-1]
-        ours = float(final[0].reward or 0)
-        scores.append(ours)
-        details.append({"opponent": "self" if opp is agent_module.agent else opp, "score": ours})
+        player_1 = float(final[0].reward or 0)
+        player_2 = float(final[1].reward or 0)
+        scores.append(player_1)
+        details.append({
+            "matchup": "agent vs agent" if opp is agent_module.agent else f"agent vs {opp}",
+            "player_1": {"agent": "candidate", "score": player_1},
+            "player_2": {
+                "agent": "candidate" if opp is agent_module.agent else opp,
+                "score": player_2,
+            },
+            "margin": player_1 - player_2,
+        })
     return {"score": sum(scores) / len(scores), "games": details}
 
 
