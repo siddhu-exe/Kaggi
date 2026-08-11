@@ -169,6 +169,8 @@ class GameState:
         self.animals_queued = set()  # animals we committed to buy on day 0
         self.feed_bought = False     # bought the initial market-wheat feed stock
         self.notes = {}              # scratch for debugging / future tuning
+        self.near_full_days = 0      # consecutive days current land is >=94% productive
+        self.utilization_day = -1    # guard utilization accounting once per day
 
 
 STATES = {0: GameState(), 1: GameState()}
@@ -520,7 +522,15 @@ def assign_plans(ctx, state):
     allocation = desired_allocation(ctx, state)
     # Reserve the closest available tiles for COOP/PASTURE before assigning
     # crops.  This changes animal placement only; portfolio counts are intact.
-    allocation = sorted(allocation, key=lambda kv: 0 if kv[0] in ("COOP", "PASTURE") else 1)
+    # After animals, put the highest-turnover crops nearest the shed.  The old
+    # portfolio order put long-lived melons nearest and short-cycle wheat/
+    # carrot at the remote NE edge, where harvest/replant travel caused the
+    # chronic 47-49/50 occupancy plateau.
+    service_order = {
+        "COOP": 0, "PASTURE": 0,
+        "CARROT": 1, "WHEAT": 2, "TOMATO": 3, "STRAWBERRY": 4, "MELON": 5,
+    }
+    allocation = sorted(allocation, key=lambda kv: service_order.get(kv[0], 9))
     for item, target in allocation:
         have = existing.get(item, 0) + planned_counts.get(item, 0)
         need = target - have
@@ -633,6 +643,19 @@ def decide_market_orders(ctx, state):
     counts = _struct_animal_counts(ctx, state)
     feed_reserve = _wheat_feed_reserve(ctx, counts, state)
 
+    # Measure productive utilization once per day. Weeds are gaps, not useful
+    # occupancy. A two-day streak avoids expanding because of a single lucky
+    # frame between harvest and replant operations.
+    if state.utilization_day != ctx.day:
+        productive = 0
+        for x, y in ctx.unlocked:
+            tile = get_tile(ctx.tiles, x, y)
+            if isinstance(tile, dict) and tile.get("kind") in ("PLANT", "COOP", "PASTURE"):
+                productive += 1
+        ratio = productive / max(1, len(ctx.unlocked))
+        state.near_full_days = state.near_full_days + 1 if ratio >= 0.94 else 0
+        state.utilization_day = ctx.day
+
     # 1) Land is a capacity investment. Do not wait for the current quadrant to
     # become full: production lost while waiting is worth more than the tile cost.
     q = len(ctx.unlocked_quadrants)
@@ -646,8 +669,8 @@ def decide_market_orders(ctx, state):
         # Finish servicing the land we already own before buying another
         # quadrant.  Otherwise the new capacity creates permanent seed/build
         # backlogs and visible empty patches.
-        current_land_full = not ctx.empty_tiles and not ctx.weed_tiles
-        if current_land_full and ctx.day >= min_day and money >= cost + reserve:
+        current_land_ready = state.near_full_days >= 2
+        if current_land_ready and ctx.day >= min_day and money >= cost + reserve:
             land_ready = True
     if land_ready and slots > 0:
         orders.append(["BUY_LAND"])
@@ -1086,7 +1109,15 @@ def _move_to_task(ctx, state, idx, pos, inv):
             if t in ctx.claimed or t == pos:
                 continue
             d = manhattan(pos, t)
-            key = (d, -_tile_value(ctx, t, state))
+            if role == "expansion" and _name in ("plant", "build"):
+                # Reserve expansion hands for the remote backlog. Without this,
+                # freshly emptied near tiles continually win nearest-task
+                # selection and the outer NE row is starved despite seeds being
+                # available in the shared seed inventory.
+                shed_distance = min(manhattan(t, s) for s in SHED_TILES)
+                key = (-shed_distance, d, -_tile_value(ctx, t, state))
+            else:
+                key = (d, -_tile_value(ctx, t, state))
             if best_key is None or key < best_key:
                 best_key = key
                 best = t
