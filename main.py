@@ -503,15 +503,34 @@ def assign_plans(ctx, state):
             struct_counts[t["kind"]] += 1
     existing.update(struct_counts)
 
+    # Animal structures are deliberately assigned first, to the tiles nearest
+    # the initial farmer/hand staging area.  This keeps the daily feed/care/
+    # collect routes short; crops can use the remaining tiles and retain the
+    # old shed-oriented ordering.  The replay shows this materially reduces
+    # worker travel for animal-heavy farms.
     free = [c for c in ctx.empty_tiles if c not in state.tile_plan]
-    free.sort(key=lambda c: manhattan(c, (SHED_HALF - 1, SHED_HALF - 1)))
+    # Animal structures get the shortest routes to the shed.  Use the nearest
+    # currently actionable shed tile (rather than a board corner); feeding,
+    # care, and collection happen every day and are the most failure-prone work.
+    shed_anchor = min(SHED_TILES, key=lambda t: manhattan(t, (SHED_HALF - 1, SHED_HALF - 1)))
+    animal_free = sorted(free, key=lambda c: (manhattan(c, shed_anchor), c[1], c[0]))
+    crop_free = sorted(free, key=lambda c: (manhattan(c, (SHED_HALF - 1, SHED_HALF - 1)), c[1], c[0]))
 
     pasture_index = sum(1 for p in state.tile_plan.values() if p.get("structure") == "PASTURE")
-    for item, target in desired_allocation(ctx, state):
+    allocation = desired_allocation(ctx, state)
+    # Reserve the closest available tiles for COOP/PASTURE before assigning
+    # crops.  This changes animal placement only; portfolio counts are intact.
+    allocation = sorted(allocation, key=lambda kv: 0 if kv[0] in ("COOP", "PASTURE") else 1)
+    for item, target in allocation:
         have = existing.get(item, 0) + planned_counts.get(item, 0)
         need = target - have
-        while need > 0 and free:
-            coord = free.pop(0)
+        while need > 0 and (animal_free if item in ("COOP", "PASTURE") else crop_free):
+            pool = animal_free if item in ("COOP", "PASTURE") else crop_free
+            coord = pool.pop(0)
+            # A tile may have been consumed from the other ordering pool.
+            if coord not in free:
+                continue
+            free.remove(coord)
             if item == "COOP":
                 state.tile_plan[coord] = {"kind":"STRUCT", "structure":"COOP", "animal":"GOOSE"}
             elif item == "PASTURE":
@@ -624,7 +643,11 @@ def decide_market_orders(ctx, state):
         # Keep enough cash for a modest next-wave seed purchase.
         reserve = PARAMS["land_reserves"][q - 1]
         min_day = PARAMS["land_days"][q - 1]
-        if ctx.day >= min_day and money >= cost + reserve:
+        # Finish servicing the land we already own before buying another
+        # quadrant.  Otherwise the new capacity creates permanent seed/build
+        # backlogs and visible empty patches.
+        current_land_full = not ctx.empty_tiles and not ctx.weed_tiles
+        if current_land_full and ctx.day >= min_day and money >= cost + reserve:
             land_ready = True
     if land_ready and slots > 0:
         orders.append(["BUY_LAND"])
