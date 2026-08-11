@@ -107,6 +107,7 @@ PARAMS = {
     "feed_days": 4,
     "endgame_day": 26,
     "land_days": [5, 12, 18],
+    "land_last_day": 18,
     "land_reserves": [700, 1400, 2200],
     "shed_overflow_force": 85,
     # Allocation weights are normalized to current unlocked/serviceable space.
@@ -169,6 +170,8 @@ class GameState:
         self.animals_queued = set()  # animals we committed to buy on day 0
         self.feed_bought = False     # bought the initial market-wheat feed stock
         self.notes = {}              # scratch for debugging / future tuning
+        self.near_full_days = 0      # consecutive days current land is >=94% productive
+        self.utilization_day = -1    # guard utilization accounting once per day
 
 
 STATES = {0: GameState(), 1: GameState()}
@@ -503,15 +506,42 @@ def assign_plans(ctx, state):
             struct_counts[t["kind"]] += 1
     existing.update(struct_counts)
 
+    # Animal structures are deliberately assigned first, to the tiles nearest
+    # the initial farmer/hand staging area.  This keeps the daily feed/care/
+    # collect routes short; crops can use the remaining tiles and retain the
+    # old shed-oriented ordering.  The replay shows this materially reduces
+    # worker travel for animal-heavy farms.
     free = [c for c in ctx.empty_tiles if c not in state.tile_plan]
-    free.sort(key=lambda c: manhattan(c, (SHED_HALF - 1, SHED_HALF - 1)))
+    # Animal structures get the shortest routes to the shed.  Use the nearest
+    # currently actionable shed tile (rather than a board corner); feeding,
+    # care, and collection happen every day and are the most failure-prone work.
+    shed_anchor = min(SHED_TILES, key=lambda t: manhattan(t, (SHED_HALF - 1, SHED_HALF - 1)))
+    animal_free = sorted(free, key=lambda c: (manhattan(c, shed_anchor), c[1], c[0]))
+    crop_free = sorted(free, key=lambda c: (manhattan(c, (SHED_HALF - 1, SHED_HALF - 1)), c[1], c[0]))
 
     pasture_index = sum(1 for p in state.tile_plan.values() if p.get("structure") == "PASTURE")
-    for item, target in desired_allocation(ctx, state):
+    allocation = desired_allocation(ctx, state)
+    # Reserve the closest available tiles for COOP/PASTURE before assigning
+    # crops.  This changes animal placement only; portfolio counts are intact.
+    # After animals, put the highest-turnover crops nearest the shed.  The old
+    # portfolio order put long-lived melons nearest and short-cycle wheat/
+    # carrot at the remote NE edge, where harvest/replant travel caused the
+    # chronic 47-49/50 occupancy plateau.
+    service_order = {
+        "COOP": 0, "PASTURE": 0,
+        "CARROT": 1, "WHEAT": 2, "TOMATO": 3, "STRAWBERRY": 4, "MELON": 5,
+    }
+    allocation = sorted(allocation, key=lambda kv: service_order.get(kv[0], 9))
+    for item, target in allocation:
         have = existing.get(item, 0) + planned_counts.get(item, 0)
         need = target - have
-        while need > 0 and free:
-            coord = free.pop(0)
+        while need > 0 and (animal_free if item in ("COOP", "PASTURE") else crop_free):
+            pool = animal_free if item in ("COOP", "PASTURE") else crop_free
+            coord = pool.pop(0)
+            # A tile may have been consumed from the other ordering pool.
+            if coord not in free:
+                continue
+            free.remove(coord)
             if item == "COOP":
                 state.tile_plan[coord] = {"kind":"STRUCT", "structure":"COOP", "animal":"GOOSE"}
             elif item == "PASTURE":
@@ -614,6 +644,19 @@ def decide_market_orders(ctx, state):
     counts = _struct_animal_counts(ctx, state)
     feed_reserve = _wheat_feed_reserve(ctx, counts, state)
 
+    # Measure productive utilization once per day. Weeds are gaps, not useful
+    # occupancy. A two-day streak avoids expanding because of a single lucky
+    # frame between harvest and replant operations.
+    if state.utilization_day != ctx.day:
+        productive = 0
+        for x, y in ctx.unlocked:
+            tile = get_tile(ctx.tiles, x, y)
+            if isinstance(tile, dict) and tile.get("kind") in ("PLANT", "COOP", "PASTURE"):
+                productive += 1
+        ratio = productive / max(1, len(ctx.unlocked))
+        state.near_full_days = state.near_full_days + 1 if ratio >= 0.94 else 0
+        state.utilization_day = ctx.day
+
     # 1) Land is a capacity investment. Do not wait for the current quadrant to
     # become full: production lost while waiting is worth more than the tile cost.
     q = len(ctx.unlocked_quadrants)
@@ -624,7 +667,13 @@ def decide_market_orders(ctx, state):
         # Keep enough cash for a modest next-wave seed purchase.
         reserve = PARAMS["land_reserves"][q - 1]
         min_day = PARAMS["land_days"][q - 1]
-        if ctx.day >= min_day and money >= cost + reserve:
+        # Finish servicing the land we already own before buying another
+        # quadrant.  Otherwise the new capacity creates permanent seed/build
+        # backlogs and visible empty patches.
+        current_land_ready = state.near_full_days >= 2
+        season_time_ready = ctx.day <= int(PARAMS["land_last_day"])
+        if (current_land_ready and season_time_ready
+                and ctx.day >= min_day and money >= cost + reserve):
             land_ready = True
     if land_ready and slots > 0:
         orders.append(["BUY_LAND"])
@@ -642,6 +691,12 @@ def decide_market_orders(ctx, state):
             break
         need = seed_need.get(crop, 0) - int(_get(ctx.seeds_remaining, crop, 0))
         if need <= 0:
+            continue
+        # Do not buy a seed that cannot reach a useful harvest before the
+        # 30-day season ends. Existing seeds may still be planted; this only
+        # prevents turning final-day cash into worthless new inventory.
+        days_left_after_today = 29 - ctx.day
+        if days_left_after_today < CROPS[crop]["max_day"]:
             continue
         unit = CROPS[crop]["seed"]
         affordable = int(max(0, money - WORKING_CASH) // unit)
@@ -670,6 +725,9 @@ def decide_market_orders(ctx, state):
         built_free = max(0, counts["built"].get(structure, 0) - occupied_for_structure - animals_waiting)
         need = min(built_free, max(0, target.get(animal, 0) - current.get(animal, 0)))
         if need <= 0:
+            continue
+        days_left_after_today = 29 - ctx.day
+        if days_left_after_today < {"GOOSE": 4, "COW": 8, "SHEEP": 6}[animal]:
             continue
         # One animal per turn prevents a huge opening cash sink.
         cost = ANIMALS[animal]["cost"]
@@ -1063,7 +1121,15 @@ def _move_to_task(ctx, state, idx, pos, inv):
             if t in ctx.claimed or t == pos:
                 continue
             d = manhattan(pos, t)
-            key = (d, -_tile_value(ctx, t, state))
+            if role == "expansion" and _name in ("plant", "build"):
+                # Reserve expansion hands for the remote backlog. Without this,
+                # freshly emptied near tiles continually win nearest-task
+                # selection and the outer NE row is starved despite seeds being
+                # available in the shared seed inventory.
+                shed_distance = min(manhattan(t, s) for s in SHED_TILES)
+                key = (-shed_distance, d, -_tile_value(ctx, t, state))
+            else:
+                key = (d, -_tile_value(ctx, t, state))
             if best_key is None or key < best_key:
                 best_key = key
                 best = t
@@ -1146,49 +1212,42 @@ if __name__ == "__main__":
         print("kaggle_environments not installed:", e)
         raise SystemExit(1)
 
-    print("=" * 72)
-    print("KAGGRICULTURE V7 — PRODUCTION THROUGHPUT / FULL LAND")
-    print("=" * 72)
-    print("Benchmark: OUR AGENT vs Kaggle starter")
-    print("Key V7 changes: 8 hands, 30 market orders, 100-tile scheduler,")
-    print("expansion workers, earlier land, larger production portfolio, day-26 liquidation.")
-
     STATES[0].reset()
     STATES[1].reset()
 
     env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
-    env.run([agent, "starter"])
+    env.run([agent, agent])
 
-    print("\nDaily checkpoints:")
+    print("\nDaily checkpoints (Agent vs Agent):")
     for step_no, step in enumerate(env.steps):
         if not isinstance(step, list) or step_no % 24 != 1:
             continue
-        p = step[0] if isinstance(step[0], dict) else {}
-        obs = p.get("observation", {}) if isinstance(p, dict) else {}
+        source = step[0] if step and isinstance(step[0], dict) else {}
+        obs = source.get("observation", {}) if isinstance(source, dict) else {}
         farms = obs.get("farms", []) or []
-        farm = farms[0] if farms else {}
-        tiles = farm.get("tiles", []) or []
-        unlocked = 0
-        occupied = 0
-        for row in tiles:
-            for tile in row:
-                if tile != "LOCKED":
-                    unlocked += 1
-                    if tile is not None:
-                        occupied += 1
-        print(
-            f"DAY {step_no // 24:02d} | "
-            f"money={farm.get('money')} | "
-            f"hands={len(farm.get('hands', []) or [])} | "
-            f"land={farm.get('unlocked_quadrants')} | "
-            f"occupied={occupied}/{unlocked}"
-        )
+        for player_idx, farm in enumerate(farms[:2]):
+            tiles = farm.get("tiles", []) or []
+            unlocked = 0
+            occupied = 0
+            for row in tiles:
+                for tile in row:
+                    if tile != "LOCKED":
+                        unlocked += 1
+                        if tile is not None:
+                            occupied += 1
+            print(
+                f"DAY {step_no // 24:02d} | PLAYER {player_idx + 1} | "
+                f"money={farm.get('money')} | "
+                f"hands={len(farm.get('hands', []) or [])} | "
+                f"land={farm.get('unlocked_quadrants')} | "
+                f"occupied={occupied}/{unlocked}"
+            )
 
     final = env.steps[-1]
     print("\nFINAL RESULT")
     for i, s in enumerate(final):
         if isinstance(s, dict):
-            print(f"PLAYER {i}: reward={s.get('reward')} status={s.get('status')}")
+            print(f"PLAYER {i + 1} (AGENT): reward={s.get('reward')} status={s.get('status')}")
 
     with open("replay.json", "w", encoding="utf-8") as f:
         json.dump(env.toJSON(), f)
