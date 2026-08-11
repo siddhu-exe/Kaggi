@@ -107,6 +107,7 @@ PARAMS = {
     "feed_days": 4,
     "endgame_day": 26,
     "land_days": [5, 12, 18],
+    "land_last_day": 18,
     "land_reserves": [700, 1400, 2200],
     "shed_overflow_force": 85,
     # Allocation weights are normalized to current unlocked/serviceable space.
@@ -670,7 +671,9 @@ def decide_market_orders(ctx, state):
         # quadrant.  Otherwise the new capacity creates permanent seed/build
         # backlogs and visible empty patches.
         current_land_ready = state.near_full_days >= 2
-        if current_land_ready and ctx.day >= min_day and money >= cost + reserve:
+        season_time_ready = ctx.day <= int(PARAMS["land_last_day"])
+        if (current_land_ready and season_time_ready
+                and ctx.day >= min_day and money >= cost + reserve):
             land_ready = True
     if land_ready and slots > 0:
         orders.append(["BUY_LAND"])
@@ -688,6 +691,12 @@ def decide_market_orders(ctx, state):
             break
         need = seed_need.get(crop, 0) - int(_get(ctx.seeds_remaining, crop, 0))
         if need <= 0:
+            continue
+        # Do not buy a seed that cannot reach a useful harvest before the
+        # 30-day season ends. Existing seeds may still be planted; this only
+        # prevents turning final-day cash into worthless new inventory.
+        days_left_after_today = 29 - ctx.day
+        if days_left_after_today < CROPS[crop]["max_day"]:
             continue
         unit = CROPS[crop]["seed"]
         affordable = int(max(0, money - WORKING_CASH) // unit)
@@ -716,6 +725,9 @@ def decide_market_orders(ctx, state):
         built_free = max(0, counts["built"].get(structure, 0) - occupied_for_structure - animals_waiting)
         need = min(built_free, max(0, target.get(animal, 0) - current.get(animal, 0)))
         if need <= 0:
+            continue
+        days_left_after_today = 29 - ctx.day
+        if days_left_after_today < {"GOOSE": 4, "COW": 8, "SHEEP": 6}[animal]:
             continue
         # One animal per turn prevents a huge opening cash sink.
         cost = ANIMALS[animal]["cost"]
