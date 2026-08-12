@@ -490,6 +490,25 @@ def assign_plans(ctx, state):
         if coord not in ctx.unlocked or get_tile(ctx.tiles, coord[0], coord[1]) is not None:
             del state.tile_plan[coord]
 
+    # When a long-cycle crop is harvested late in the season, reuse that tile
+    # for the best crop that can still reach first yield. Without this rollover,
+    # MELON/TOMATO/STRAWBERRY plans remain attached to empty tiles after their
+    # seed-buy horizon closes and the farm steadily decommissions itself.
+    days_left_after_today = 29 - ctx.day
+    viable_crops = [
+        crop for crop in ("MELON", "STRAWBERRY", "TOMATO", "CARROT", "WHEAT")
+        if CROPS[crop]["first"] <= days_left_after_today
+    ]
+    if viable_crops:
+        replacement = max(
+            viable_crops,
+            key=lambda crop: (CROPS[crop]["base"] - CROPS[crop]["seed"], -CROPS[crop]["first"]),
+        )
+        for coord, plan in state.tile_plan.items():
+            if (plan.get("kind") == "CROP"
+                    and CROPS[plan["crop"]]["first"] > days_left_after_today):
+                plan["crop"] = replacement
+
     planned_counts = {}
     pasture_animals = []
     for p in state.tile_plan.values():
@@ -692,11 +711,12 @@ def decide_market_orders(ctx, state):
         need = seed_need.get(crop, 0) - int(_get(ctx.seeds_remaining, crop, 0))
         if need <= 0:
             continue
-        # Do not buy a seed that cannot reach a useful harvest before the
-        # 30-day season ends. Existing seeds may still be planted; this only
-        # prevents turning final-day cash into worthless new inventory.
+        # Do not buy a seed that cannot reach its first useful harvest before
+        # the season ends.  Using max_day here silently disabled replacement
+        # planting for short-cycle crops (and even ongoing crops) days before
+        # they could produce, so harvested tiles accumulated as empty gaps.
         days_left_after_today = 29 - ctx.day
-        if days_left_after_today < CROPS[crop]["max_day"]:
+        if days_left_after_today < CROPS[crop]["first"]:
             continue
         unit = CROPS[crop]["seed"]
         affordable = int(max(0, money - WORKING_CASH) // unit)
@@ -1030,7 +1050,11 @@ def _move_to_task(ctx, state, idx, pos, inv):
     else:
         role = "animal"
 
-    if expansion_backlog >= 8 and ctx.day < 25:
+    # Keep expansion/replanting specialists active whenever a meaningful
+    # backlog exists.  The old day-25 cutoff left harvested one-time crops
+    # empty for the rest of the season even when replacement seeds were
+    # affordable and still had time to yield.
+    if expansion_backlog >= 8:
         if role == "expansion":
             categories = [
                 ("build", build_tiles, True),

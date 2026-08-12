@@ -123,8 +123,8 @@ grow, decay, weeds), market price refresh, income update, farm update.
 
 ### Strategy in one paragraph
 **Deploy capital on day 0, then scale from there — no phases.** In a 30-day season
-idle cash produces nothing, so on turn 1 we spend close to the full $3000: hire the
-max **5 hands** (≈ $12 under Fibonacci — near-free labor), **buy animals + their
+idle cash produces nothing, so on turn 1 we spend close to the full $3000: hire up to
+**8 hands** (Fibonacci cost remains small), **buy animals + their
 structures immediately** (buying market wheat as feed rather than waiting to grow
 it, since animals take days to reach first production), and **buy seed across ALL
 crop types** to fill every tile — staples *and* premium/ongoing crops from the
@@ -145,10 +145,10 @@ quadrant is nearly full **and** cash is healthy.
 | `GameState` / `STATE` | Module-global, persists across turns within an episode. Holds `tile_plan` (intended crop/structure per tile), `last_day_hired`, plus day-0 bookkeeping (`animals_queued`, `feed_bought`). `reset()` at episode start via `_reset_if_new_episode`. |
 | `TurnContext` | Parses `obs` once per turn: money, tiles, hands, shed, seeds, prices, town. Scans the world into task lists: `harvest_tiles`, `water_tiles`, `fertilize_tiles`, `weed_tiles`, `empty_tiles`, `animal_tiles`, `empty_structs`. Tracks `claimed` (tiles handled this turn) and `shed_ledger`/`seeds_remaining` (mutable, so units don't double-spend). |
 | `update_phase` | **No-op stub** (kept so the `agent()` dispatcher is untouched). The phased strategy was replaced by day-0 deployment. |
-| `assign_plans` / `desired_allocation` | Decide what each empty tile should become. `desired_allocation` returns a **single** aggressive plan (`BASE_ALLOCATION`) used from day 0, scaled up per unlocked quadrant, then adjusted for **opponent diversification** (back off glut goods they flood, lean into ones they have zero of). |
+| `assign_plans` / `desired_allocation` | Decide what each empty tile should become. `desired_allocation` returns a **single** aggressive plan (`BASE_ALLOCATION`) used from day 0, scaled up per unlocked quadrant, then adjusted for **opponent diversification** (back off glut goods they flood, lean into ones they have zero of). Late in the season, plans whose crop cannot reach first yield are rolled over to the highest-value still-viable crop, preventing harvested tiles from becoming permanent gaps. |
 | `decide_unit_action(ctx, state, idx)` | **Priority checklist** for one unit (farmer = idx 0, hands = idx≥1). First match wins: HARVEST → WATER → FERTILIZE → FEED → CARE → COLLECT_FERTILIZER → PLACE animal → BUILD → PLANT → DIG weed; else move to nearest highest-priority task; else carry produce to shed / `DROP`; else `PASS`. High-value tiles outrank staples via `_tile_value`. *(Unchanged in this pivot.)* |
-| `decide_market_orders(ctx, state)` | Assembles, then truncates to 10: HIRE → **BUY_ANIMAL** (front-loaded) → **BUY_SEED all crops** → **BUY_PRODUCT wheat feed** → BUY_PRODUCT fertilizer → BUY_LAND → price-reactive SELLs. Spends down toward `WORKING_CASH` — no big reserve. |
-| `decide_hiring(ctx, state)` | Once/day at hour 0; **`HANDS_PER_DAY` (5) every day**, Fibonacci-cost-aware. |
+| `decide_market_orders(ctx, state)` | Assembles, then truncates to 10: HIRE → **BUY_ANIMAL** (front-loaded) → **BUY_SEED all crops** → **BUY_PRODUCT wheat feed** → BUY_PRODUCT fertilizer → BUY_LAND → price-reactive SELLs. Seed eligibility uses each crop's `first` yield day, not `max_day`, so replacement seeds remain purchasable while they can still produce before season end. |
+| `decide_hiring(ctx, state)` | Once/day at hour 0; **`HANDS_PER_DAY` (8) every day**, Fibonacci-cost-aware. |
 | `_struct_animal_counts(ctx)` | Counts planned vs built coops/pastures and owned animals (shed + placed), so we front-load animal buys without re-buying after placement. |
 | `decide_sells(ctx, state, feed_reserve)` → `_sell_quantity` | **Price-reactive** SELL orders: volume scales linearly between a per-good `SELL_THROTTLE` floor and base price; dump at/above base or on overflow; hold near the floor. Carves out the wheat feed reserve; biases town-demanded goods first; clamps premium goods to ≤ half the holding per turn. |
 | `agent(obs)` | Top-level dispatcher. **Wrapped in try/except** — any bug returns a safe `{"farmer":["PASS"], "hands":[["PASS"]…], "market":[]}` so a runtime error can never fail the validation episode. |
@@ -157,6 +157,13 @@ quadrant is nearly full **and** cash is healthy.
 - **Never plant what can't be watered today.** `PLANT` only fires when the seed is
   held **and** `hour < turnsPerDay - 2` (time left for a unit to water it), so a
   fresh seed never weeds on planting night.
+- **Late-season replacement safety.** Seed buying checks `days_left >= first`,
+  because first yield is the relevant production horizon. Checking `max_day`
+  previously disabled replacement planting several days too early, causing the
+  observed occupancy collapse after day 20. `assign_plans` also changes stale,
+  no-longer-viable crop plans to a crop that can still reach first yield.
+- **Backlog remains serviced through season end.** Expansion/replanting workers
+  are no longer disabled at day 25 when empty planned tiles remain.
 - **Feed before you own.** The wheat feed reserve is sized to animals we *intend* to
   own (planned + built structures), not just placed ones, and we buy market wheat to
   reach it — so animals are safe to buy on day 0. Wheat sells only the surplus above
@@ -182,6 +189,33 @@ quadrant is nearly full **and** cash is healthy.
 - **Which crops get fertilizer:** `FERTILIZE_CROPS`.
 - **Glut classification:** `GLUT_SENSITIVE`, `GLUT_TOLERANT`.
 - **Opponent diversification:** the flood/open-lane rule in `desired_allocation`.
+
+### Regression verification
+
+Run the full local harness:
+
+```bash
+python main.py
+```
+
+For a compact daily trajectory and seeded self-play comparison, use the temporary
+analysis scripts from the investigation if they are present in `/tmp`:
+
+```bash
+python /tmp/analyze_kaggriculture.py 1000
+python /tmp/compare_kaggriculture.py
+```
+
+The important regression signal is that occupancy must not follow the old
+47/50 → 14/50 monotonic collapse. In the reference seed 1000 run after the fix,
+occupancy was 47/50 on day 20, 39/50 on day 25, recovered to 45/50 on day 26,
+and ended at 38/50; exact values can vary with environment version and seed.
+Self-play can be exactly symmetric when both agents receive the same map and
+opponent-visible state. Verify several seeds before treating identical scores as
+state leakage; seeded asymmetric runs should diverge. Animal allocation is a
+separate tuning question: the base plan currently has 8 animal structures planned
+(`COOP=2`, `PASTURE=6`), while a higher-animal trial should be compared only after
+the occupancy regression passes.
 
 ### Testing
 `main.py` has an `if __name__ == "__main__":` harness that runs **Agent vs Agent**
