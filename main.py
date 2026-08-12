@@ -121,6 +121,10 @@ PARAMS = {
     "normal_sell": [[0.70, 0.75], [0.45, 0.40], [0.0, 0.10]],
     "fertilizer_buy_price": 120,
     "wheat_buy_price": 40,
+    # Experimental only: reserve the third unlocked quadrant for animals.
+    # Leave false for the production baseline until matched trials justify it.
+    "animal_quadrant": False,
+    "animal_quadrant_day": 15,
 }
 
 # Optional tuner override; Kaggle submissions simply omit this environment var.
@@ -139,7 +143,7 @@ WORKING_CASH = PARAMS["working_cash"]
 
 # Hands to hire every day.  5 hands ~= $1+1+2+3+5 = $12/day under Fibonacci — the
 # labor is near-free, so there is no reason to hold back.
-HANDS_PER_DAY = PARAMS["hands_per_day"]
+HANDS_PER_DAY = PARAMS["hands_per_day"] + (4 if PARAMS.get("animal_quadrant") else 0)
 MAX_TARGET_TILES = 100
 ENDGAME_DAY = PARAMS["endgame_day"]
 
@@ -490,6 +494,24 @@ def assign_plans(ctx, state):
         if coord not in ctx.unlocked or get_tile(ctx.tiles, coord[0], coord[1]) is not None:
             del state.tile_plan[coord]
 
+    if PARAMS.get("animal_quadrant") and len(ctx.unlocked_quadrants) >= 3:
+        third = ctx.unlocked_quadrants[2]
+        bounds = {
+            "NW": (range(0, 5), range(0, 5)), "NE": (range(5, 10), range(0, 5)),
+            "SW": (range(0, 5), range(5, 10)), "SE": (range(5, 10), range(5, 10)),
+        }
+        xs, ys = bounds[third]
+        animal_coords = sorted(((x, y) for y in ys for x in xs),
+                               key=lambda c: min(manhattan(c, s) for s in SHED_TILES))
+        for index, coord in enumerate(animal_coords):
+            if get_tile(ctx.tiles, *coord) is None:
+                state.tile_plan[coord] = (
+                    {"kind": "STRUCT", "structure": "COOP", "animal": "GOOSE"}
+                    if index % 5 == 0 else
+                    {"kind": "STRUCT", "structure": "PASTURE",
+                     "animal": "COW" if index % 2 else "SHEEP"}
+                )
+
     # When a long-cycle crop is harvested late in the season, reuse that tile
     # for the best crop that can still reach first yield. Without this rollover,
     # MELON/TOMATO/STRAWBERRY plans remain attached to empty tiles after their
@@ -689,7 +711,9 @@ def decide_market_orders(ctx, state):
         # Finish servicing the land we already own before buying another
         # quadrant.  Otherwise the new capacity creates permanent seed/build
         # backlogs and visible empty patches.
-        current_land_ready = state.near_full_days >= 2
+        animal_q_due = (PARAMS.get("animal_quadrant") and q == 2
+                        and ctx.day >= int(PARAMS.get("animal_quadrant_day", 15)))
+        current_land_ready = state.near_full_days >= 2 or animal_q_due
         season_time_ready = ctx.day <= int(PARAMS["land_last_day"])
         if (current_land_ready and season_time_ready
                 and ctx.day >= min_day and money >= cost + reserve):

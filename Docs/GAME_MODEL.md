@@ -217,6 +217,29 @@ separate tuning question: the base plan currently has 8 animal structures planne
 (`COOP=2`, `PASTURE=6`), while a higher-animal trial should be compared only after
 the occupancy regression passes.
 
+### August 2026 strategy experiments
+
+These results are matched local trials, not new production defaults.
+
+**Strawberry:** do not increase allocation based on a large final shed count alone.
+Against `starter` on seed 1000, days 24-29 showed strawberry prices of 270-301
+(2.25-2.51 times the $120 base) and zero strawberry in the shed. The existing
+seller liquidates readily at reasonable prices. The reported 290-unit self-play
+remainder therefore points to shared-market saturation and/or match-specific
+delivery timing, not insufficient strawberry production. Moving forced liquidation
+from day 26 to day 24 did not establish a reliable score improvement, so neither
+the strawberry allocation nor `endgame_day` was changed.
+
+**Dedicated animal quadrant:** rejected. The opt-in `animal_quadrant` parameter
+exists only to keep the experiment reproducible and defaults to `False`. With seed
+1000 against `starter`, baseline earned $61,049, stayed on NW+NE, and ended with 2
+live animals in 4 structures. The experimental variant bought SW, built 26 animal
+structures, and added four daily hands. It peaked at 12 live animals but finished
+with $0, 1 survivor, and 25 empty structures. The feed, replacement-animal, and
+labor costs exhausted cash without sustaining the quadrant. Do not enable this
+variant unless the animal logistics model is redesigned and new matched trials
+reverse this result.
+
 ### Testing
 `main.py` has an `if __name__ == "__main__":` harness that runs **Agent vs Agent**
 over a full 720-turn season. Its daily checkpoints print separate labeled rows for
