@@ -1603,8 +1603,24 @@ if __name__ == "__main__":
     final = env.steps[-1]
     print("\nFINAL RESULT")
     for i, s in enumerate(final):
-        if isinstance(s, dict):
-            print(f"PLAYER {i + 1} (AGENT): reward={s.get('reward')} status={s.get('status')}")
+        reward = s.get("reward") if isinstance(s, dict) else getattr(s, "reward", None)
+        status = s.get("status") if isinstance(s, dict) else getattr(s, "status", None)
+        print(f"PLAYER {i + 1} (AGENT): reward={reward} status={status}")
+
+    # The game engine is two-player. Report a second independent matchup as
+    # Players 3/4 so one local harness run includes both requested comparisons:
+    # Players 1/2 are agent self-play; Players 3/4 are agent vs starter.
+    STATES[0].reset()
+    STATES[1].reset()
+    env_vs_starter = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
+    env_vs_starter.run([agent, "starter"])
+    final_vs_starter = env_vs_starter.steps[-1]
+    print("\nPLAYER 3/4 RESULT (AGENT VS STARTER)")
+    for i, s in enumerate(final_vs_starter):
+        label = "PLAYER 3 (AGENT)" if i == 0 else "PLAYER 4 (STARTER)"
+        reward = s.get("reward") if isinstance(s, dict) else getattr(s, "reward", None)
+        status = s.get("status") if isinstance(s, dict) else getattr(s, "status", None)
+        print(f"{label}: reward={reward} status={status}")
 
     with open("replay.json", "w", encoding="utf-8") as f:
         json.dump(env.toJSON(), f)
