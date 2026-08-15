@@ -102,18 +102,21 @@ PARAMS = {
     "hands_per_day": 8,
     "actions_per_unit_day": 18,
     "crop_daily_load": 1.0,
-    "animal_daily_load": 3.0,
+    "animal_daily_load": 4.0,
     "working_cash": 50,
     "feed_days": 4,
     "endgame_day": 26,
-    "land_days": [5, 12, 18],
+    "land_days": [5, 6, 18],
     "land_last_day": 18,
+    "max_quadrants": 2,
     "land_reserves": [700, 1400, 2200],
     "shed_overflow_force": 85,
     # Allocation weights are normalized to current unlocked/serviceable space.
     "allocation": {
-        "MELON": 45, "TOMATO": 20, "STRAWBERRY": 12,
-        "WHEAT": 8, "CARROT": 7, "COOP": 2, "PASTURE": 6,
+        # On the two-quadrant plan, five structures fit the initial NW field
+        # and ten fit after NE unlocks. Pastures dominate for milk/wool value.
+        "MELON": 20, "TOMATO": 8, "STRAWBERRY": 5,
+        "WHEAT": 4, "CARROT": 3, "COOP": 4, "PASTURE": 6,
     },
     "pasture_sheep_fraction": 0.5,
     # Price/base ratio -> fraction of shed stock sold this turn.
@@ -125,6 +128,7 @@ PARAMS = {
     # Leave false for the production baseline until matched trials justify it.
     "animal_quadrant": False,
     "animal_quadrant_day": 15,
+    "animal_quadrant_cash_reserve": 5000,
 }
 
 # Optional tuner override; Kaggle submissions simply omit this environment var.
@@ -143,7 +147,7 @@ WORKING_CASH = PARAMS["working_cash"]
 
 # Hands to hire every day.  5 hands ~= $1+1+2+3+5 = $12/day under Fibonacci — the
 # labor is near-free, so there is no reason to hold back.
-HANDS_PER_DAY = PARAMS["hands_per_day"] + (4 if PARAMS.get("animal_quadrant") else 0)
+HANDS_PER_DAY = PARAMS["hands_per_day"]
 MAX_TARGET_TILES = 100
 ENDGAME_DAY = PARAMS["endgame_day"]
 
@@ -176,6 +180,11 @@ class GameState:
         self.notes = {}              # scratch for debugging / future tuning
         self.near_full_days = 0      # consecutive days current land is >=94% productive
         self.utilization_day = -1    # guard utilization accounting once per day
+        self.animal_quadrant_name = None
+        self.animal_quadrant_target = 0
+        self.animal_quadrant_growth_day = -1
+        self.animal_block_target = 0
+        self.animal_block_growth_day = -1
 
 
 STATES = {0: GameState(), 1: GameState()}
@@ -241,6 +250,77 @@ def nearest_shed_tile(pos, unlocked):
     if not cands:
         cands = list(SHED_TILES)  # fall back; still passable to stand on
     return min(cands, key=lambda t: manhattan(pos, t))
+
+
+QUADRANT_BOUNDS = {
+    "NW": (range(0, 5), range(0, 5)), "NE": (range(5, 10), range(0, 5)),
+    "SW": (range(0, 5), range(5, 10)), "SE": (range(5, 10), range(5, 10)),
+}
+
+
+def quadrant_coords(name):
+    xs, ys = QUADRANT_BOUNDS[name]
+    return {(x, y) for y in ys for x in xs}
+
+
+def tile_expansion_order(unlocked, shed=(4, 4)):
+    """Return a deterministic spatial order: shed rings, then row/column.
+
+    This is deliberately tile-level rather than quota-level. Every new claim
+    is adjacent to the already serviced center whenever possible, producing a
+    compact animal block before crops expand into outer rings.
+    """
+    return sorted(unlocked, key=lambda c: (max(abs(c[0] - shed[0]), abs(c[1] - shed[1])),
+                                           abs(c[0] - shed[0]) + abs(c[1] - shed[1]),
+                                           c[1], c[0]))
+
+
+def shed_distance(coord):
+    """Global distance to the single central shed footprint.
+
+    This deliberately ignores quadrant identity, so unlocking NE extends the
+    same NW animal cluster across x=4/5 instead of starting another cluster.
+    """
+    return min(manhattan(coord, shed_tile) for shed_tile in SHED_TILES)
+
+
+def animal_cluster_score(coord):
+    """Soft distance falloff for the one farm-wide animal block.
+
+    Distance dominates, while a stable coordinate phase interleaves some crop
+    slots at the block's outer edge. Beyond two rings the penalty rises sharply,
+    making those tiles crops unless the configured animal target grows far past
+    the current ten-structure steady state.
+    """
+    distance = shed_distance(coord)
+    phase = ((coord[0] * 17 + coord[1] * 31) % 7) / 7.0
+    outer_penalty = max(0, distance - 2) * 4.0
+    return distance + phase * (0.35 + 0.45 * distance) + outer_penalty
+
+
+def dedicated_quadrant(ctx, state):
+    if not PARAMS.get("animal_quadrant") or len(ctx.unlocked_quadrants) < 3:
+        return set()
+    if state.animal_quadrant_name not in ctx.unlocked_quadrants:
+        state.animal_quadrant_name = ctx.unlocked_quadrants[2]
+    return quadrant_coords(state.animal_quadrant_name)
+
+
+def dedicated_animal_stats(ctx, state):
+    coords = dedicated_quadrant(ctx, state)
+    built = alive = healthy = empty = 0
+    for coord in coords:
+        tile = get_tile(ctx.tiles, *coord)
+        if isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE"):
+            built += 1
+            if tile.get("animal") is None:
+                empty += 1
+            else:
+                alive += 1
+                if int(_get(tile, "consecutive_unfed", 0)) == 0:
+                    healthy += 1
+    return {"coords": coords, "built": built, "alive": alive,
+            "healthy": healthy, "empty": empty}
 
 
 def bonus_window_start(cropinfo):
@@ -309,6 +389,7 @@ class TurnContext:
         self.fertilize_tiles = []
         self.weed_tiles = []
         self.empty_tiles = []         # unlocked None tiles
+        self.animal_quadrant_tiles = set()
 
         for (x, y) in self.unlocked:
             tile = get_tile(self.tiles, x, y)
@@ -349,6 +430,9 @@ class TurnContext:
 
         # Shed non-seed item total (for overflow-forced sells).
         self.shed_total = sum(int(v) for v in self.shed.values() if isinstance(v, (int, float)))
+
+    def is_dedicated_coord(self, coord):
+        return coord in self.animal_quadrant_tiles
 
     # ---- inventory helpers -------------------------------------------------
     def unit_inv(self, idx):
@@ -435,6 +519,17 @@ def desired_allocation(ctx, state):
     scale = min(capacity_scale, tile_scale)
     plan = [(k, max(0, int(round(n * scale)))) for k, n in raw]
 
+    # Front-load a compact block safely: release at most one new structure per
+    # healthy day, reaching five in NW and ten once NE is available.
+    animal_target = state.animal_block_target
+    coop_target = int(round(animal_target * 0.4))
+    pasture_target = animal_target - coop_target
+    for i, (kind, count) in enumerate(plan):
+        if kind == "COOP":
+            plan[i] = (kind, coop_target)
+        elif kind == "PASTURE":
+            plan[i] = (kind, pasture_target)
+
     # If the opponent is heavily concentrated in one premium good, shift a few
     # tiles toward the other premium lane.  Keep the portfolio total at 100.
     opp = _opp_crop_counts(ctx)
@@ -491,26 +586,51 @@ def assign_plans(ctx, state):
     """Fill every unlocked tile with a stable production plan, then keep the
     same plan as new quadrants unlock.  Pastures alternate cow/sheep by player."""
     for coord in list(state.tile_plan.keys()):
-        if coord not in ctx.unlocked or get_tile(ctx.tiles, coord[0], coord[1]) is not None:
+        plan = state.tile_plan[coord]
+        keep_built_dedicated = (plan.get("kind") == "STRUCT"
+                                and isinstance(get_tile(ctx.tiles, *coord), dict)
+                                and get_tile(ctx.tiles, *coord).get("kind") in ("COOP", "PASTURE"))
+        if coord not in ctx.unlocked or (get_tile(ctx.tiles, coord[0], coord[1]) is not None
+                                         and not keep_built_dedicated):
             del state.tile_plan[coord]
 
-    if PARAMS.get("animal_quadrant") and len(ctx.unlocked_quadrants) >= 3:
-        third = ctx.unlocked_quadrants[2]
-        bounds = {
-            "NW": (range(0, 5), range(0, 5)), "NE": (range(5, 10), range(0, 5)),
-            "SW": (range(0, 5), range(5, 10)), "SE": (range(5, 10), range(5, 10)),
-        }
-        xs, ys = bounds[third]
-        animal_coords = sorted(((x, y) for y in ys for x in xs),
-                               key=lambda c: min(manhattan(c, s) for s in SHED_TILES))
-        for index, coord in enumerate(animal_coords):
+    block_tiles = []
+    for x, y in ctx.unlocked:
+        tile = get_tile(ctx.tiles, x, y)
+        if isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE"):
+            block_tiles.append(tile)
+    block_healthy = all(tile.get("animal") is not None
+                        and int(_get(tile, "consecutive_unfed", 0)) == 0
+                        for tile in block_tiles)
+    block_cap = 5 if len(ctx.unlocked_quadrants) == 1 else 10
+    can_release_next = (state.animal_block_target == 0 or
+                        (state.animal_block_target == len(block_tiles) and block_healthy))
+    if state.animal_block_target < block_cap and can_release_next:
+        state.animal_block_target += 1
+
+    aq = dedicated_animal_stats(ctx, state)
+    ctx.animal_quadrant_tiles = aq["coords"]
+    if aq["coords"]:
+        # Grow one structure at a time. The next slot is released only after all
+        # existing dedicated structures contain healthy animals. A 4:1 pasture/
+        # coop mix prioritizes higher-value milk and wool while retaining some
+        # faster egg cash flow; pastures alternate cow/sheep.
+        current_ready = (aq["built"] == 0 or
+                         (aq["built"] == aq["alive"] and aq["healthy"] == aq["alive"]))
+        if (current_ready and state.animal_quadrant_target < 25
+                and state.animal_quadrant_growth_day != ctx.day):
+            state.animal_quadrant_target += 1
+            state.animal_quadrant_growth_day = ctx.day
+        animal_coords = sorted(aq["coords"],
+                               key=lambda c: (min(manhattan(c, s) for s in SHED_TILES), c[1], c[0]))
+        for index, coord in enumerate(animal_coords[:state.animal_quadrant_target]):
             if get_tile(ctx.tiles, *coord) is None:
-                state.tile_plan[coord] = (
-                    {"kind": "STRUCT", "structure": "COOP", "animal": "GOOSE"}
-                    if index % 5 == 0 else
-                    {"kind": "STRUCT", "structure": "PASTURE",
-                     "animal": "COW" if index % 2 else "SHEEP"}
-                )
+                if index % 5 == 4:
+                    plan = {"kind": "STRUCT", "structure": "COOP", "animal": "GOOSE"}
+                else:
+                    plan = {"kind": "STRUCT", "structure": "PASTURE",
+                            "animal": "COW" if index % 2 else "SHEEP"}
+                state.tile_plan[coord] = plan
 
     # When a long-cycle crop is harvested late in the season, reuse that tile
     # for the best crop that can still reach first yield. Without this rollover,
@@ -552,13 +672,19 @@ def assign_plans(ctx, state):
     # collect routes short; crops can use the remaining tiles and retain the
     # old shed-oriented ordering.  The replay shows this materially reduces
     # worker travel for animal-heavy farms.
-    free = [c for c in ctx.empty_tiles if c not in state.tile_plan]
+    free = [c for c in ctx.empty_tiles
+            if c not in state.tile_plan and c not in ctx.animal_quadrant_tiles]
     # Animal structures get the shortest routes to the shed.  Use the nearest
     # currently actionable shed tile (rather than a board corner); feeding,
     # care, and collection happen every day and are the most failure-prone work.
-    shed_anchor = min(SHED_TILES, key=lambda t: manhattan(t, (SHED_HALF - 1, SHED_HALF - 1)))
-    animal_free = sorted(free, key=lambda c: (manhattan(c, shed_anchor), c[1], c[0]))
-    crop_free = sorted(free, key=lambda c: (manhattan(c, (SHED_HALF - 1, SHED_HALF - 1)), c[1], c[0]))
+    ordered_free = [c for c in tile_expansion_order(ctx.unlocked) if c in free]
+    # One global cluster: animal candidates are ranked by distance to the shed,
+    # while crop candidates use the same global field in the opposite direction.
+    animal_free = sorted(ordered_free, key=lambda c: (animal_cluster_score(c), c[1], c[0]))
+    reserved_n = 10 if len(ctx.unlocked_quadrants) >= 2 else 5
+    reserved_animal_slots = set(animal_free[:reserved_n])
+    crop_free = sorted((c for c in ordered_free if c not in reserved_animal_slots),
+                       key=lambda c: (shed_distance(c), c[1], c[0]))
 
     pasture_index = sum(1 for p in state.tile_plan.values() if p.get("structure") == "PASTURE")
     allocation = desired_allocation(ctx, state)
@@ -574,7 +700,12 @@ def assign_plans(ctx, state):
     }
     allocation = sorted(allocation, key=lambda kv: service_order.get(kv[0], 9))
     for item, target in allocation:
-        have = existing.get(item, 0) + planned_counts.get(item, 0)
+        # Retained dedicated plans describe structures already included in
+        # existing, so only empty planned tiles count as additional capacity.
+        pending = sum(1 for coord, p in state.tile_plan.items()
+                      if (p.get("crop") if p.get("kind") == "CROP" else p.get("structure")) == item
+                      and get_tile(ctx.tiles, *coord) is None)
+        have = existing.get(item, 0) + pending
         need = target - have
         while need > 0 and (animal_free if item in ("COOP", "PASTURE") else crop_free):
             pool = animal_free if item in ("COOP", "PASTURE") else crop_free
@@ -619,7 +750,17 @@ def decide_hiring(ctx, state):
     cost = 0
     a, b = 1, 1
 
-    for _ in range(HANDS_PER_DAY):
+    aq = dedicated_animal_stats(ctx, state)
+    # Daily animal workload is PARAMS[animal_daily_load] actions per animal;
+    # each extra hand supplies actions_per_unit_day capacity. These hires are
+    # additional to the unchanged crop-farm labor pool.
+    dedicated_load_animals = aq["alive"] + aq["empty"]
+    dedicated_hands = int(math.ceil(
+        dedicated_load_animals * float(PARAMS["animal_daily_load"]) /
+        max(1.0, float(PARAMS["actions_per_unit_day"]))
+    ))
+    total_hands = HANDS_PER_DAY + dedicated_hands
+    for _ in range(total_hands):
         price = a
         if ctx.money - cost < price:
             break
@@ -703,7 +844,7 @@ def decide_market_orders(ctx, state):
     q = len(ctx.unlocked_quadrants)
     land_costs = [1000, 2000, 4000]
     land_ready = False
-    if q < 4:
+    if q < min(4, int(PARAMS.get("max_quadrants", 4))):
         cost = land_costs[q - 1]
         # Keep enough cash for a modest next-wave seed purchase.
         reserve = PARAMS["land_reserves"][q - 1]
@@ -711,9 +852,30 @@ def decide_market_orders(ctx, state):
         # Finish servicing the land we already own before buying another
         # quadrant.  Otherwise the new capacity creates permanent seed/build
         # backlogs and visible empty patches.
+        # At the start of a turn fed_today is reset, so ctx.unfed_tiles is not
+        # itself a failure signal. Use the persistent consecutive counter.
+        animal_failures = any(
+            isinstance(get_tile(ctx.tiles, x, y), dict)
+            and int(_get(get_tile(ctx.tiles, x, y), "consecutive_unfed", 0)) > 0
+            for x, y in ctx.unlocked
+            if isinstance(get_tile(ctx.tiles, x, y), dict)
+            and get_tile(ctx.tiles, x, y).get("kind") in ("COOP", "PASTURE")
+        )
+        productive_now = sum(
+            1 for x, y in ctx.unlocked
+            if isinstance(get_tile(ctx.tiles, x, y), dict)
+            and get_tile(ctx.tiles, x, y).get("kind") in ("PLANT", "COOP", "PASTURE")
+        )
+        stable_existing_farm = productive_now / max(1, len(ctx.unlocked)) >= 0.85
+        no_health_failures = stable_existing_farm and not animal_failures
         animal_q_due = (PARAMS.get("animal_quadrant") and q == 2
-                        and ctx.day >= int(PARAMS.get("animal_quadrant_day", 15)))
-        current_land_ready = state.near_full_days >= 2 or animal_q_due
+                        and ctx.day >= int(PARAMS.get("animal_quadrant_day", 15))
+                        and no_health_failures
+                        and money >= cost + float(PARAMS.get("animal_quadrant_cash_reserve", 5000)))
+        early_ne_ready = (q == 1 and ctx.day >= 5
+                          and productive_now / max(1, len(ctx.unlocked)) >= 0.50
+                          and not animal_failures)
+        current_land_ready = state.near_full_days >= 2 or early_ne_ready or animal_q_due
         season_time_ready = ctx.day <= int(PARAMS["land_last_day"])
         if (current_land_ready and season_time_ready
                 and ctx.day >= min_day and money >= cost + reserve):
@@ -722,6 +884,67 @@ def decide_market_orders(ctx, state):
         orders.append(["BUY_LAND"])
         money -= land_costs[q - 1]
         slots -= 1
+
+    # Existing animals are sunk productive capital. Replenish feed before
+    # seeds or replacement animals so the 10-order cap cannot starve them.
+    feed_ordered = False
+    if slots > 0:
+        wheat_have = int(_get(ctx.shed, "WHEAT", 0))
+        animals_now = sum(counts["animals"].values())
+        desired_feed = animals_now * int(PARAMS["feed_days"]) + 3
+        if wheat_have < desired_feed:
+            price = int(_get(ctx.prices, "WHEAT", 25))
+            n = min(desired_feed - wheat_have,
+                    int(max(0, money - WORKING_CASH) // max(1, price)))
+            if n > 0:
+                orders.append(["BUY_PRODUCT", "WHEAT", n])
+                money -= n * price
+                slots -= 1
+                feed_ordered = True
+
+    # Built-empty structures block the staged animal ramp, so fill one before
+    # discretionary seed orders. Never buy beyond actual built capacity.
+    if slots > 0 and not feed_ordered:
+        waiting_animals = sum(int(_get(ctx.shed, a, 0)) for a in ANIMALS)
+        if waiting_animals == 0:
+            for x, y, kind, _tile in ctx.empty_structs:
+                plan = state.tile_plan.get((x, y), {})
+                animal = plan.get("animal")
+                if animal not in ANIMALS or ANIMALS[animal]["structure"] != kind:
+                    animal = "GOOSE" if kind == "COOP" else "SHEEP"
+                cost = ANIMALS[animal]["cost"]
+                if money >= cost + WORKING_CASH:
+                    orders.append(["BUY_ANIMAL", animal, 1])
+                    money -= cost
+                    slots -= 1
+                break
+
+    # Dedicated quadrant animals are a hard production dependency: reserve a
+    # market slot for the next built empty structure before discretionary seeds.
+    if slots > 0 and PARAMS.get("animal_quadrant"):
+        for animal in ("SHEEP", "COW", "GOOSE"):
+            structure = ANIMALS[animal]["structure"]
+            free_built = sum(1 for x, y, k, t in ctx.empty_structs
+                             if (x, y) in ctx.animal_quadrant_tiles and k == structure)
+            have = counts["animals"].get(animal, 0)
+            if free_built > 0 and have < counts["target_animals"].get(animal, 0):
+                cost = ANIMALS[animal]["cost"]
+                if money >= cost + WORKING_CASH:
+                    orders.append(["BUY_ANIMAL", animal, 1]); money -= cost; slots -= 1
+                break
+        # If a structure is built but its retained plan was refreshed this turn,
+        # still buy the matching animal directly; placement is handled by the
+        # dedicated worker and must not wait for a stale target counter.
+        if slots > 0:
+            for _x, _y, kind, _tile in ctx.empty_structs:
+                if (_x, _y) not in ctx.animal_quadrant_tiles:
+                    continue
+                animal = "GOOSE" if kind == "COOP" else ("SHEEP" if (_x + _y) % 2 == 0 else "COW")
+                cost = ANIMALS[animal]["cost"]
+                waiting = int(_get(ctx.shed, animal, 0))
+                if waiting == 0 and money >= cost + WORKING_CASH:
+                    orders.append(["BUY_ANIMAL", animal, 1]); money -= cost; slots -= 1
+                break
 
     # 2) Buy seeds for the currently unlocked empty/planned crop tiles.
     seed_need = {}
@@ -789,7 +1012,7 @@ def decide_market_orders(ctx, state):
         if wheat_have < desired_feed:
             price = int(_get(ctx.prices, "WHEAT", 25))
             n = min(desired_feed - wheat_have, int(max(0, money - WORKING_CASH) // max(1, price)))
-            if n > 0 and price <= PARAMS["wheat_buy_price"]:
+            if n > 0:
                 orders.append(["BUY_PRODUCT", "WHEAT", n])
                 money -= n * price
                 slots -= 1
@@ -875,10 +1098,79 @@ def decide_unit_action(ctx, state, idx):
     inv = ctx.unit_inv(idx)
     tile = get_tile(ctx.tiles, pos[0], pos[1])
     on_shed = pos in SHED_TILES
+    maintenance_workers = max(2, 1 + int(math.ceil(
+        ctx.placed_animals * float(PARAMS["animal_daily_load"])
+        / max(1.0, float(PARAMS["actions_per_unit_day"])))) if ctx.placed_animals else 2)
+    maintenance_start = max(1, len(ctx.hands) - maintenance_workers + 1)
+    animal_maintainer = idx == 0 if not ctx.hands else idx >= maintenance_start
+    dedicated_count = max(0, len(ctx.hands) - HANDS_PER_DAY)
+    dedicated = bool(ctx.animal_quadrant_tiles) and dedicated_count > 0 and idx >= HANDS_PER_DAY
+    dedicated_tasks = [t for t in ctx.animal_tiles if t in ctx.animal_quadrant_tiles]
+    dedicated_unfed = [t for t in ctx.unfed_tiles if t in ctx.animal_quadrant_tiles]
+
+    # If hiring cannot supply enough extra hands on a cash-tight day, divide
+    # the fixed pool by measured work rather than abandoning the quadrant.
+    aq_alive = sum(1 for t in ctx.animal_quadrant_tiles
+                   if isinstance(get_tile(ctx.tiles, *t), dict)
+                   and get_tile(ctx.tiles, *t).get("animal") is not None)
+    crop_tiles = sum(ctx.growing_counts.values())
+    animal_load = aq_alive * float(PARAMS["animal_daily_load"])
+    crop_load = crop_tiles * float(PARAMS["crop_daily_load"])
+    shared_dedicated = int(round(len(ctx.hands) * animal_load / max(1.0, animal_load + crop_load)))
+    if ctx.animal_quadrant_tiles and shared_dedicated > 0:
+        dedicated = dedicated or idx > max(0, len(ctx.hands) - shared_dedicated)
+
+    # Dedicated hands never answer crop work. They shuttle route-sized wheat
+    # loads from the shed and remain in the animal quadrant until its own queue
+    # is clear, preventing the previous shared-pool starvation failure.
+    if dedicated:
+        urgent = _nearest_unclaimed(ctx, pos, dedicated_unfed)
+        if urgent is not None:
+            if urgent == pos and int(_get(inv, "WHEAT", 0)) > 0:
+                ctx.claimed.add(urgent); return ["FEED"]
+            if int(_get(inv, "WHEAT", 0)) > 0:
+                return move_toward(pos, urgent)
+        act = _on_tile_action(ctx, state, idx, pos, tile, inv)
+        if act is not None and (pos in ctx.animal_quadrant_tiles or tile is None):
+            return act
+        if on_shed:
+            if (dedicated_unfed and int(_get(ctx.shed_ledger, "WHEAT", 0)) > 0
+                    and not int(_get(inv, "WHEAT", 0))):
+                load = min(4, int(_get(ctx.shed_ledger, "WHEAT", 0)))
+                ctx.shed_ledger["WHEAT"] -= load
+                return ["PICKUP", "WHEAT", load]
+            for _x, _y, kind, _tile in ctx.empty_structs:
+                if (_x, _y) in ctx.animal_quadrant_tiles:
+                    for aname, ainfo in ANIMALS.items():
+                        if ainfo["structure"] == kind and int(_get(ctx.shed_ledger, aname, 0)) > 0:
+                            ctx.shed_ledger[aname] -= 1
+                            return ["PICKUP", aname, 1]
+            if int(_get(ctx.shed_ledger, "WHEAT", 0)) > 0 and not int(_get(inv, "WHEAT", 0)):
+                load = max(1, min(4, len(dedicated_unfed) or len(dedicated_tasks)))
+                ctx.shed_ledger["WHEAT"] -= load
+                return ["PICKUP", "WHEAT", load]
+        target = _nearest_unclaimed(ctx, pos, dedicated_tasks)
+        if carrying_animal := any(int(_get(inv, a, 0)) > 0 for a in ANIMALS):
+            placement = _nearest_unclaimed(ctx, pos, [(x, y) for x, y, _k, _t in ctx.empty_structs
+                                                      if (x, y) in ctx.animal_quadrant_tiles])
+            if placement is not None:
+                target = placement
+        if target is None:
+            target = _nearest_unclaimed(ctx, pos, [t for t, p in state.tile_plan.items()
+                                                   if p.get("kind") == "STRUCT"
+                                                   and t in ctx.animal_quadrant_tiles
+                                                   and get_tile(ctx.tiles, *t) is None])
+        if target is not None:
+            return move_toward(pos, target)
+        if any(int(v) for k, v in inv.items() if k not in ANIMALS and isinstance(v, (int, float))):
+            return ["DROP"] if on_shed else move_toward(pos, nearest_shed_tile(pos, ctx.unlocked))
+        return ["PASS"]
 
     # === 1) Farm-wide emergency dispatch.  Exactly one nearest free unit claims
     # each unfed animal before anyone gets distracted by its current tile.
-    urgent = _nearest_unclaimed(ctx, pos, ctx.unfed_tiles)
+    regular_unfed = ([t for t in ctx.unfed_tiles if t not in ctx.animal_quadrant_tiles]
+                     if animal_maintainer else [])
+    urgent = _nearest_unclaimed(ctx, pos, regular_unfed)
     if urgent is not None:
         if urgent == pos and int(_get(inv, "WHEAT", 0)) > 0:
             ctx.claimed.add(urgent)
@@ -887,8 +1179,12 @@ def decide_unit_action(ctx, state, idx):
             ctx.claimed.add(urgent)
             return move_toward(pos, urgent)
         if on_shed and int(_get(ctx.shed_ledger, "WHEAT", 0)) > 0:
-            ctx.shed_ledger["WHEAT"] -= 1
-            return ["PICKUP", "WHEAT", 1]
+            # Carry a route-sized batch so one shed trip can feed several
+            # animals. One-wheat trips consumed the day in travel and caused
+            # the post-day-20 animal collapse.
+            load = min(4, int(_get(ctx.shed_ledger, "WHEAT", 0)))
+            ctx.shed_ledger["WHEAT"] -= load
+            return ["PICKUP", "WHEAT", load]
         shed = nearest_shed_tile(pos, ctx.unlocked)
         if pos != shed:
             return move_toward(pos, shed)
@@ -1003,9 +1299,15 @@ def _on_tile_action(ctx, state, idx, pos, tile, inv):
 def _shed_pickup_action(ctx, state, idx, inv):
     """When standing at the shed with nothing better to do: grab an animal that
     needs placing, or fertilizer for a pending high-value crop."""
-    if ctx.unfed_tiles and int(_get(ctx.shed_ledger, "WHEAT", 0)) > 0:
-        ctx.shed_ledger["WHEAT"] -= 1
-        return ["PICKUP", "WHEAT", 1]
+    maintenance_workers = max(2, 1 + int(math.ceil(
+        ctx.placed_animals * float(PARAMS["animal_daily_load"])
+        / max(1.0, float(PARAMS["actions_per_unit_day"])))) if ctx.placed_animals else 2)
+    maintenance_start = max(1, len(ctx.hands) - maintenance_workers + 1)
+    animal_maintainer = idx == 0 if not ctx.hands else idx >= maintenance_start
+    if animal_maintainer and ctx.unfed_tiles and int(_get(ctx.shed_ledger, "WHEAT", 0)) > 0:
+        load = min(4, int(_get(ctx.shed_ledger, "WHEAT", 0)))
+        ctx.shed_ledger["WHEAT"] -= load
+        return ["PICKUP", "WHEAT", load]
 
     for (x, y, kind, tile) in ctx.empty_structs:
         for aname, ainfo in ANIMALS.items():
@@ -1063,16 +1365,23 @@ def _move_to_task(ctx, state, idx, pos, inv):
         if get_tile(ctx.tiles, coord[0], coord[1]) is None
     )
 
-    # idx 0 = farmer. Hands 1-2 are expansion workers, 3-5 are crop workers,
-    # and 6+ are animal/logistics workers.
+    # Reserve a measured tail of the hand pool for animal maintenance. This is
+    # a division of the existing labor pool, not an unlimited second pool.
+    animal_workers = max(2, 1 + int(math.ceil(
+        ctx.placed_animals * float(PARAMS["animal_daily_load"])
+        / max(1.0, float(PARAMS["actions_per_unit_day"])))) if ctx.placed_animals else 2)
+    animal_start = max(1, len(ctx.hands) - animal_workers + 1)
+    # idx 0 = farmer; early hands expand/crop, tail hands maintain animals.
     if idx == 0:
         role = "farmer"
+    elif idx >= animal_start:
+        role = "animal"
     elif idx <= 2:
         role = "expansion"
     elif idx <= 5:
         role = "crop"
     else:
-        role = "animal"
+        role = "crop"
 
     # Keep expansion/replanting specialists active whenever a meaningful
     # backlog exists.  The old day-25 cutoff left harvested one-time crops
