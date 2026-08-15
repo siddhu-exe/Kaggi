@@ -106,17 +106,19 @@ PARAMS = {
     "working_cash": 50,
     "feed_days": 4,
     "endgame_day": 26,
-    "land_days": [5, 6, 18],
+    "land_days": [5, 11, 18],
     "land_last_day": 18,
-    "max_quadrants": 2,
-    "land_reserves": [700, 1400, 2200],
+    "max_quadrants": 3,
+    "land_reserves": [700, 18000, 2200],
     "shed_overflow_force": 85,
     # Allocation weights are normalized to current unlocked/serviceable space.
     "allocation": {
         # On the two-quadrant plan, five structures fit the initial NW field
         # and ten fit after NE unlocks. Pastures dominate for milk/wool value.
-        "MELON": 20, "TOMATO": 8, "STRAWBERRY": 5,
-        "WHEAT": 4, "CARROT": 3, "COOP": 4, "PASTURE": 6,
+        # Mass-melon portfolio within the proven two-quadrant boundary. Keep
+        # ten animal tiles and enough short-cycle crops for feed/replanting.
+        "MELON": 24, "TOMATO": 7, "STRAWBERRY": 4,
+        "WHEAT": 3, "CARROT": 2, "COOP": 4, "PASTURE": 6,
     },
     "pasture_sheep_fraction": 0.5,
     # Price/base ratio -> fraction of shed stock sold this turn.
@@ -582,6 +584,21 @@ def _opp_crop_counts(ctx):
         pass
     return counts
 
+
+def _opp_production_counts(ctx):
+    """Public opponent production by crop/animal for anti-glut planning."""
+    counts = _opp_crop_counts(ctx)
+    for row in ctx.opp_farm.get("tiles", []) or []:
+        for tile in row:
+            if (isinstance(tile, dict)
+                    and tile.get("kind") in ("COOP", "PASTURE")
+                    and tile.get("animal") in ANIMALS):
+                animal = tile["animal"]
+                counts[animal] = counts.get(animal, 0) + 1
+                product = ANIMALS[animal]["product"]
+                counts[product] = counts.get(product, 0) + 1
+    return counts
+
 def assign_plans(ctx, state):
     """Fill every unlocked tile with a stable production plan, then keep the
     same plan as new quadrants unlock.  Pastures alternate cow/sheep by player."""
@@ -602,7 +619,10 @@ def assign_plans(ctx, state):
     block_healthy = all(tile.get("animal") is not None
                         and int(_get(tile, "consecutive_unfed", 0)) == 0
                         for tile in block_tiles)
-    block_cap = 5 if len(ctx.unlocked_quadrants) == 1 else 10
+    opp_production = _opp_production_counts(ctx)
+    premium_animal_flood = opp_production.get("WOOL", 0) >= 5 and opp_production.get("MILK", 0) >= 5
+    block_cap = 5 if len(ctx.unlocked_quadrants) == 1 else (
+        10 if len(ctx.unlocked_quadrants) == 2 else (13 if premium_animal_flood else 16))
     can_release_next = (state.animal_block_target == 0 or
                         (state.animal_block_target == len(block_tiles) and block_healthy))
     if state.animal_block_target < block_cap and can_release_next:
@@ -672,8 +692,13 @@ def assign_plans(ctx, state):
     # collect routes short; crops can use the remaining tiles and retain the
     # old shed-oriented ordering.  The replay shows this materially reduces
     # worker travel for animal-heavy farms.
+    third_coords = (quadrant_coords(ctx.unlocked_quadrants[2])
+                    if len(ctx.unlocked_quadrants) >= 3 else set())
+    third_limit = min(25, 4 + max(0, ctx.day - 11) * 2)
+    allowed_third = set(tile_expansion_order(third_coords)[:third_limit]) if third_coords else set()
     free = [c for c in ctx.empty_tiles
-            if c not in state.tile_plan and c not in ctx.animal_quadrant_tiles]
+            if c not in state.tile_plan and c not in ctx.animal_quadrant_tiles
+            and (c not in third_coords or c in allowed_third)]
     # Animal structures get the shortest routes to the shed.  Use the nearest
     # currently actionable shed tile (rather than a board corner); feeding,
     # care, and collection happen every day and are the most failure-prone work.
@@ -681,7 +706,7 @@ def assign_plans(ctx, state):
     # One global cluster: animal candidates are ranked by distance to the shed,
     # while crop candidates use the same global field in the opposite direction.
     animal_free = sorted(ordered_free, key=lambda c: (animal_cluster_score(c), c[1], c[0]))
-    reserved_n = 10 if len(ctx.unlocked_quadrants) >= 2 else 5
+    reserved_n = 5 if len(ctx.unlocked_quadrants) == 1 else (10 if len(ctx.unlocked_quadrants) == 2 else 16)
     reserved_animal_slots = set(animal_free[:reserved_n])
     crop_free = sorted((c for c in ordered_free if c not in reserved_animal_slots),
                        key=lambda c: (shed_distance(c), c[1], c[0]))
@@ -699,6 +724,14 @@ def assign_plans(ctx, state):
         "CARROT": 1, "WHEAT": 2, "TOMATO": 3, "STRAWBERRY": 4, "MELON": 5,
     }
     allocation = sorted(allocation, key=lambda kv: service_order.get(kv[0], 9))
+    third_quadrant = (quadrant_coords(ctx.unlocked_quadrants[2])
+                      if len(ctx.unlocked_quadrants) >= 3 else set())
+    third_order = tile_expansion_order(third_quadrant) if third_quadrant else []
+    third_index = {coord: index for index, coord in enumerate(third_order)}
+    opponent = _opp_production_counts(ctx)
+    melon_flood = (opponent.get("MELON", 0) >= 10
+                   or float(_get(ctx.prices, "MELON", 250)) / 250.0 < 0.45)
+    wool_flood = opponent.get("WOOL", 0) >= 5
     for item, target in allocation:
         # Retained dedicated plans describe structures already included in
         # existing, so only empty planned tiles count as additional capacity.
@@ -707,8 +740,13 @@ def assign_plans(ctx, state):
                       and get_tile(ctx.tiles, *coord) is None)
         have = existing.get(item, 0) + pending
         need = target - have
-        while need > 0 and (animal_free if item in ("COOP", "PASTURE") else crop_free):
-            pool = animal_free if item in ("COOP", "PASTURE") else crop_free
+        if item == "COOP":
+            # Coops stay in the original NW block. Animal expansion across NE
+            # and the third quadrant is pasture/cow focused as requested.
+            pool = [c for c in animal_free if c in quadrant_coords("NW")]
+        else:
+            pool = animal_free if item == "PASTURE" else crop_free
+        while need > 0 and pool:
             coord = pool.pop(0)
             # A tile may have been consumed from the other ordering pool.
             if coord not in free:
@@ -717,13 +755,24 @@ def assign_plans(ctx, state):
             if item == "COOP":
                 state.tile_plan[coord] = {"kind":"STRUCT", "structure":"COOP", "animal":"GOOSE"}
             elif item == "PASTURE":
-                # P0 emphasizes sheep, P1 balances cow/sheep.
-                frac = float(PARAMS["pasture_sheep_fraction"])
-                animal = "SHEEP" if (pasture_index % 100) / 100.0 < frac else "COW"
+                if coord in third_quadrant:
+                    animal = "COW" if wool_flood else "SHEEP"
+                elif coord not in quadrant_coords("NW"):
+                    animal = "COW"
+                else:
+                    animal = "SHEEP" if pasture_index % 2 == 0 else "COW"
                 state.tile_plan[coord] = {"kind":"STRUCT", "structure":"PASTURE", "animal":animal}
                 pasture_index += 1
             else:
-                state.tile_plan[coord] = {"kind":"CROP", "crop":item}
+                crop = item
+                if coord in third_quadrant:
+                    phase = third_index.get(coord, 0) % 5
+                    if phase < 4:
+                        crop = ("TOMATO" if melon_flood and phase % 2 == 0 else
+                                "WHEAT" if melon_flood else "MELON")
+                    else:
+                        crop = "STRAWBERRY"
+                state.tile_plan[coord] = {"kind":"CROP", "crop":crop}
             planned_counts[item] = planned_counts.get(item, 0) + 1
             need -= 1
 
@@ -759,7 +808,8 @@ def decide_hiring(ctx, state):
         dedicated_load_animals * float(PARAMS["animal_daily_load"]) /
         max(1.0, float(PARAMS["actions_per_unit_day"]))
     ))
-    total_hands = HANDS_PER_DAY + dedicated_hands
+    extra_third_hands = 2 if len(ctx.unlocked_quadrants) >= 3 else 0
+    total_hands = HANDS_PER_DAY + dedicated_hands + extra_third_hands
     for _ in range(total_hands):
         price = a
         if ctx.money - cost < price:
@@ -875,7 +925,12 @@ def decide_market_orders(ctx, state):
         early_ne_ready = (q == 1 and ctx.day >= 5
                           and productive_now / max(1, len(ctx.unlocked)) >= 0.50
                           and not animal_failures)
-        current_land_ready = state.near_full_days >= 2 or early_ne_ready or animal_q_due
+        early_third_ready = (q == 2 and 11 <= ctx.day <= 14
+                             and productive_now / max(1, len(ctx.unlocked)) >= 0.50
+                             and not animal_failures
+                             and money >= cost + reserve)
+        current_land_ready = (early_third_ready if q == 2 else
+                              (state.near_full_days >= 2 or early_ne_ready or animal_q_due))
         season_time_ready = ctx.day <= int(PARAMS["land_last_day"])
         if (current_land_ready and season_time_ready
                 and ctx.day >= min_day and money >= cost + reserve):
